@@ -1,0 +1,6 @@
+{"chat_id":"chat-a","has_attachment":false,"is_group":false,"message_id":"m1","participant_id":"alice","sender_role":"other","service":"iMessage","text":"are we still meeting?","timestamp_ns":1000000000}
+{"chat_id":"chat-a","has_attachment":false,"is_group":false,"message_id":"m2","participant_id":"me","sender_role":"me","service":"iMessage","text":"yes, see you there","timestamp_ns":2000000000}
+{"chat_id":"chat-b","has_attachment":false,"is_group":false,"message_id":"m3","participant_id":"bob","sender_role":"other","service":"iMessage","text":"want coffee?","timestamp_ns":90000000000000}
+{"chat_id":"chat-b","has_attachment":false,"is_group":false,"message_id":"m4","participant_id":"me","sender_role":"me","service":"iMessage","text":"absolutely ☕️","timestamp_ns":90001000000000}
+{"chat_id":"chat-c","has_attachment":false,"is_group":false,"message_id":"m5","participant_id":"carol","sender_role":"other","service":"iMessage","text":"made it home","timestamp_ns":180000000000000}
+{"chat_id":"chat-c","has_attachment":false,"is_group":false,"message_id":"m6","participant_id":"me","sender_role":"me","service":"iMessage","text":"great! sleep well","timestamp_ns":180001000000000}

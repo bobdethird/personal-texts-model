@@ -1,0 +1,18 @@
+source_db: ~/Library/Messages/chat.db
+snapshot_db: work/snapshot/chat.db
+work_dir: work
+output_dir: outputs
+session_gap_minutes: 360
+merge_gap_minutes: 2
+split:
+  train: 0.90
+  validation: 0.05
+  test: 0.05
+  guard_days: 7
+redaction:
+  urls: true
+  emails: true
+  phone_numbers: true
+include_attachment_marker: true
+minimum_body_recovery_rate: 0.90
+seed: 42

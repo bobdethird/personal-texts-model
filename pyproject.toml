@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "texts-to-transformer"
+version = "0.1.0"
+description = "Train a tiny Transformer from scratch on your iMessage history, entirely on your Mac"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "mlx==0.32.0",
+  "numpy>=2.0,<3",
+  "pytypedstream>=0.1,<1",
+  "pyyaml>=6.0,<7",
+  "tokenizers>=0.22,<0.23",
+  "typer>=0.16,<1",
+]
+
+[project.scripts]
+imessage-mlx = "imessage_mlx.cli:app"
+
+[tool.uv]
+dev-dependencies = [
+  "pytest>=8,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/imessage_mlx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
