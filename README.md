@@ -159,9 +159,9 @@ uv run imessage-mlx corpus-stats \
   --output work/tokens
 ```
 
-Read `work/reports/model-selection.json`. The project refuses real training below one million
-tokens and selects the largest preset supported by the corpus. A low token-to-parameter ratio is
-clearly marked as a memorization-prone experiment.
+Read `work/reports/model-selection.json`. The reply pipeline refuses real training below one million
+tokens and selects the largest reply preset supported by the corpus. Rewrite training uses the
+separate task-specific policy documented below.
 
 ### 6. Train from random initialization
 
@@ -243,6 +243,72 @@ uv run imessage-mlx chat \
   --repetition-penalty 1.2
 ```
 
+## Experimental casual rewrite mode
+
+Rewrite mode trains a separate model to transform a neutral draft into the owner's casual texting
+style. Prepare private JSONL where the neutral version is the input and the original user-authored
+message is the target:
+
+```json
+{"pair_id":"p1","timestamp_ns":1000000000,"neutral_text":"I will be there at seven.","styled_text":"ill be there at 7"}
+```
+
+Never reverse these fields. `styled_text` is the text whose style the model learns. Pair files,
+splits, token arrays, tokenizers, and model artifacts stay under the ignored private directories.
+
+Pairs can be supplied manually or generated from recent outgoing messages with OpenAI. The optional
+generator sends redacted message text to OpenAI, so review its data policy before running it. Message
+content is never printed or written to the aggregate report. Put the credential in the ignored
+`.env` file:
+
+```text
+OPENAI_API_KEY=your_key_here
+OPENAI_MODEL=gpt-5.5
+```
+
+Start with a resumable 500-message pilot:
+
+```bash
+uv run imessage-mlx generate-rewrite-pairs --limit 500
+uv run imessage-mlx review-rewrite-pairs --sample-size 50
+uv run imessage-mlx prepare-rewrites
+
+uv run imessage-mlx train-tokenizer \
+  --train work/rewrite/splits/train.jsonl \
+  --output outputs/rewrite-tokenizer \
+  --vocab-size 2048
+
+uv run imessage-mlx rewrite-corpus-stats
+
+uv run imessage-mlx train \
+  --config configs/model-rewrite-190k.yaml \
+  --data work/rewrite/tokens \
+  --tokenizer outputs/rewrite-tokenizer \
+  --output outputs/runs/rewrite-model \
+  --selection-report work/rewrite/reports/model-selection.json
+
+uv run imessage-mlx export \
+  --checkpoint outputs/runs/rewrite-model/best \
+  --output outputs/rewrite-final \
+  --split-report work/rewrite/reports/split-report.json \
+  --splits work/rewrite/splits
+
+uv run imessage-mlx rewrite \
+  "I will be there at seven." \
+  --model outputs/rewrite-final
+```
+
+Rewrite training applies loss only to `styled_text`, not to the neutral prompt or padding. The
+rewrite selector examines the training split only and requires at least 10,000 unique pairs, 100,000
+supervised target tokens, and two target tokens per model parameter. It selects the largest eligible
+rewrite preset with no unsafe fallback. For the current corpus, `model-rewrite-190k` is the expected
+choice; `model-rewrite-290k` is selected only if its measured ratio reaches two.
+
+These task-specific thresholds are still heuristics, not a quality guarantee. This tiny model may
+change meaning or memorize private text, so review every result before sending it. The standard
+`evaluate` command remains reply-specific and rejects rewrite checkpoints rather than reporting
+unmasked, misleading metrics.
+
 ## What this model can and cannot do
 
 It can learn:
@@ -269,6 +335,8 @@ a pretrained model instead; this repository intentionally demonstrates true from
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `model-1m` | 4 | 128 | 4 | 384 | 256 | 4,096 | 1.38M |
 | `model-7m` | 6 | 256 | 8 | 768 | 512 | 4,096 | 6.16M |
+| `model-rewrite-190k` | 3 | 48 | 4 | 144 | 256 | 2,048 | 188K |
+| `model-rewrite-290k` | 3 | 64 | 4 | 192 | 256 | 2,048 | 291K |
 
 See [the architecture guide](docs/architecture.md) for the model, data, and checkpoint design.
 
@@ -284,8 +352,8 @@ git ls-files work outputs
 
 The final command must print nothing. The test suite uses synthetic SQLite and JSONL fixtures only.
 It covers snapshot immutability, attributed-body decoding, extraction accounting, pseudonymization,
-split isolation, tokenizer behavior, causal masking, one-batch overfitting, checkpoint resume,
-compiled MLX training, evaluation, export, and fresh-process inference.
+split isolation, tokenizer behavior, causal and target-only masking, one-batch overfitting,
+checkpoint resume, compiled MLX training, evaluation, export, and fresh-process inference.
 
 After a real run, perform the aggregate Gate A-D audit:
 
@@ -307,7 +375,7 @@ data, interrupted runs, strange output, and privacy audit failures.
 
 ```text
 configs/                    data and model presets
-src/imessage_mlx/data/      snapshot, decoding, extraction, privacy, sessions, splits
+src/imessage_mlx/data/      snapshot, extraction, privacy, sessions, splits, rewrite pairs
 src/imessage_mlx/model/     decoder-only Transformer implementation
 src/imessage_mlx/tokenizer/ local tokenizer training
 src/imessage_mlx/train.py   MLX training loop

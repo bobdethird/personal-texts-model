@@ -20,6 +20,8 @@ SPECIAL_TOKENS = [
     "<|url|>",
     "<|email|>",
     "<|phone|>",
+    "<|rewrite|>",
+    "<|draft|>",
 ]
 
 
@@ -45,6 +47,7 @@ def train_tokenizer(
         vocab_size=vocab_size,
         min_frequency=minimum_frequency,
         special_tokens=SPECIAL_TOKENS,
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         show_progress=False,
     )
 

@@ -24,26 +24,43 @@ def export_model(
     temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
     temporary.chmod(0o700)
     try:
+        training_config_path = checkpoint_path / "training-config.json"
+        training_config = (
+            json.loads(training_config_path.read_text(encoding="utf-8"))
+            if training_config_path.exists()
+            else {}
+        )
+        task = str(training_config.get("task", "reply"))
+        if task not in {"reply", "rewrite"}:
+            raise ValueError(f"Unsupported model task {task!r}")
         for name in ("model.safetensors", "model-config.json"):
             shutil.copy2(checkpoint_path / name, temporary / name)
         shutil.copytree(checkpoint_path / "tokenizer", temporary / "tokenizer")
         generation_config = {
             "max_new_tokens": 64,
-            "temperature": 0.8,
-            "top_p": 0.9,
+            "temperature": 0.5 if task == "rewrite" else 0.8,
+            "top_p": 0.8 if task == "rewrite" else 0.9,
             "repetition_penalty": 1.1,
             "stop_tokens": ["<|turn_end|>", "<|eos|>"],
+            "task": task,
         }
         write_json(temporary / "generation-config.json", generation_config)
         metrics: dict[str, Any] = {}
         if metrics_path is not None and Path(metrics_path).exists():
             metrics = json.loads(Path(metrics_path).read_text(encoding="utf-8"))
+            metrics_task = str(metrics.get("task", "reply"))
+            if metrics_task != task:
+                raise ValueError(
+                    f"Cannot attach {metrics_task!r} metrics to a {task!r} model artifact"
+                )
         write_json(temporary / "metrics.json", metrics)
         manifest: dict[str, Any] = {
             "model_sha256": sha256_file(temporary / "model.safetensors"),
             "private_local_artifact": True,
             "pretrained_weights_used": False,
             "pretrained_tokenizer_used": False,
+            "task": task,
+            "capabilities": [task],
         }
         if split_report_path is not None and Path(split_report_path).exists():
             manifest["split_report"] = json.loads(
@@ -55,12 +72,16 @@ def export_model(
                 for name in ("train", "validation", "test")
             }
         write_json(temporary / "data-manifest.json", manifest)
+        command = (
+            'uv run imessage-mlx rewrite "neutral draft" --model outputs/rewrite-final'
+            if task == "rewrite"
+            else "uv run imessage-mlx chat --model outputs/final"
+        )
         readme = (
-            "# Private local iMessage model\n\n"
+            f"# Private local iMessage {task} model\n\n"
             "This artifact was trained from random initialization and is sensitive. "
             "Keep it local.\n\n"
-            "Run from the project root:\n\n"
-            "```bash\nuv run imessage-mlx chat --model outputs/final\n```\n"
+            f"Run from the project root:\n\n```bash\n{command}\n```\n"
         )
         (temporary / "README.md").write_text(readme, encoding="utf-8")
         (temporary / "README.md").chmod(0o600)

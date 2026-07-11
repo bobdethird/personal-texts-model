@@ -23,6 +23,9 @@ database identities with keyed HMAC pseudonyms.
 6. `sessions.py` groups chronologically adjacent messages into conversations.
 7. `split.py` deduplicates complete sessions and performs chronological splitting with guard bands.
 8. `privacy_audit.py` verifies canonical fields, hashed identifiers, roles, and obvious-PII removal.
+9. `rewrite.py` validates neutral-to-styled pairs and serializes the separate rewrite task.
+10. `pair_generation.py` optionally asks OpenAI to neutralize recent outgoing messages in resumable,
+    structured batches without logging message text.
 
 Splitting complete sessions before tokenizer training prevents adjacent messages or overlapping
 windows from leaking across train, validation, and test data. The tokenizer sees only the training
@@ -34,11 +37,12 @@ The project trains a byte-level BPE tokenizer with explicit conversation tokens:
 
 ```text
 <|bos|> <|eos|> <|conversation|> <|me|> <|other|> <|turn_end|>
-<|attachment|> <|url|> <|email|> <|phone|>
+<|attachment|> <|url|> <|email|> <|phone|> <|rewrite|> <|draft|>
 ```
 
 Byte-level tokenization provides complete coverage for emoji, multilingual text, unusual spelling,
-and punctuation without a pretrained vocabulary.
+and punctuation without a pretrained vocabulary. The trainer reserves the complete byte alphabet.
+Reply models request a 4,096-token vocabulary; the smaller rewrite models request 2,048.
 
 ## Model
 
@@ -59,6 +63,27 @@ The model is initialized randomly. No external weights or tokenizer are download
 `src/imessage_mlx/train.py` packs the token stream into fixed causal windows and optimizes shifted
 next-token cross-entropy. Training uses AdamW, gradient clipping, warmup plus cosine decay, compiled
 fixed-shape MLX updates, periodic validation, best-checkpoint selection, and early stopping.
+
+Rewrite data uses an explicit task prompt:
+
+```text
+<|bos|><|rewrite|>
+<|draft|>neutral draft<|turn_end|>
+<|me|>styled target<|turn_end|>
+<|eos|>
+```
+
+Complete pairs are packed without crossing a context boundary. An aligned loss mask supervises only
+the styled target and its turn terminator; prompt and padding tokens do not affect optimization.
+Reply models retain the original unmasked causal objective. Rewrite and reply models are exported as
+separate artifacts.
+
+Model selection is task-specific. Reply selection retains its original one-million-token hard
+minimum and ten-token-per-parameter heuristic. Rewrite selection considers only the training split,
+requires at least 10,000 unique pairs and 100,000 supervised target tokens, then selects the largest
+rewrite candidate with at least two supervised target tokens per parameter. It returns no model
+when the gates fail. The rewrite presets are approximately 188K and 291K parameters at a full
+2,048-token vocabulary.
 
 Each checkpoint contains:
 
@@ -83,7 +108,8 @@ perplexity, a unigram baseline, token n-gram overlap with training data, and obv
 sampled generations. It stores aggregate counts only.
 
 `src/imessage_mlx/export.py` creates an inference-only artifact containing model weights,
-configuration, tokenizer, metrics, and split hashes. Optimizer state and source text are excluded.
+configuration, tokenizer, task capabilities, metrics, and split hashes. Optimizer state and source
+text are excluded.
 
 `src/imessage_mlx/audit.py` rechecks the complete Gate A-D evidence, test suite, private file
 permissions, Git exclusions, artifact hash, and fresh-process chat command.

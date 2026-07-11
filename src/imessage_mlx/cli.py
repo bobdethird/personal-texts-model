@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -9,19 +11,30 @@ from typing import Annotated
 
 import mlx.core as mx
 import typer
+from dotenv import load_dotenv
 
 from imessage_mlx.audit import completion_audit
 from imessage_mlx.config import load_yaml, resolve_path
 from imessage_mlx.data.extract import extract_messages
 from imessage_mlx.data.inspect_schema import inspect_schema
+from imessage_mlx.data.pair_generation import (
+    create_rewrite_review,
+    generate_openai_rewrite_pairs,
+)
 from imessage_mlx.data.privacy_audit import audit_extracted_messages
+from imessage_mlx.data.rewrite import prepare_rewrite_dataset
 from imessage_mlx.data.sessions import build_sessions
 from imessage_mlx.data.snapshot import can_open_readonly, create_snapshot
 from imessage_mlx.data.split import split_sessions
-from imessage_mlx.dataset import encode_all_splits, select_model
+from imessage_mlx.dataset import (
+    encode_all_rewrite_splits,
+    encode_all_splits,
+    select_model,
+    select_rewrite_model,
+)
 from imessage_mlx.evaluate import evaluate_checkpoint
 from imessage_mlx.export import export_model
-from imessage_mlx.generate import stream_reply
+from imessage_mlx.generate import generate_rewrite, stream_reply
 from imessage_mlx.tokenizer.train import load_tokenizer, train_tokenizer
 from imessage_mlx.train import train_model
 from imessage_mlx.utils import ensure_private_dir, write_json
@@ -158,6 +171,98 @@ def prepare_command(
     _emit({"extraction": extraction, "sessions": sessions, "split": split_report})
 
 
+@app.command("prepare-rewrites")
+def prepare_rewrites_command(
+    pairs: Annotated[Path, typer.Option(help="Private neutral-to-styled pair JSONL")] = Path(
+        "work/rewrite/pairs.jsonl"
+    ),
+    processed: Annotated[Path, typer.Option(help="Validated private pair JSONL")] = Path(
+        "work/rewrite/processed/pairs.jsonl"
+    ),
+    splits: Annotated[Path, typer.Option(help="Chronological rewrite split directory")] = Path(
+        "work/rewrite/splits"
+    ),
+    preparation_report: Annotated[
+        Path, typer.Option(help="Aggregate pair preparation report")
+    ] = Path("work/rewrite/reports/preparation.json"),
+    split_report: Annotated[Path, typer.Option(help="Aggregate rewrite split report")] = Path(
+        "work/rewrite/reports/split-report.json"
+    ),
+    guard_days: Annotated[int, typer.Option(min=0)] = 7,
+) -> None:
+    """Validate and chronologically split private neutral-to-styled rewrite pairs."""
+    report = prepare_rewrite_dataset(
+        resolve_path(pairs),
+        resolve_path(processed),
+        resolve_path(splits),
+        resolve_path(preparation_report),
+        resolve_path(split_report),
+        guard_days=guard_days,
+    )
+    _emit(report)
+
+
+@app.command("generate-rewrite-pairs")
+def generate_rewrite_pairs_command(
+    messages: Annotated[Path, typer.Option(help="Private extracted message JSONL")] = Path(
+        "work/extracted/messages.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Private generated pair JSONL")] = Path(
+        "work/rewrite/pairs.jsonl"
+    ),
+    report: Annotated[Path, typer.Option(help="Aggregate generation report")] = Path(
+        "work/rewrite/reports/pair-generation.json"
+    ),
+    model: Annotated[str | None, typer.Option(help="OpenAI model ID")] = None,
+    limit: Annotated[int, typer.Option(min=1)] = 500,
+    batch_size: Annotated[int, typer.Option(min=1, max=100)] = 20,
+    concurrency: Annotated[int, typer.Option(min=1, max=20)] = 4,
+    max_characters: Annotated[int, typer.Option(min=1)] = 1_000,
+) -> None:
+    """Generate resumable neutral-to-styled pairs with the OpenAI Responses API."""
+    load_dotenv()
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise typer.BadParameter("Set OPENAI_API_KEY in the environment or ignored .env file")
+    model_name = model or os.environ.get("OPENAI_MODEL", "gpt-5.5")
+    generation_report = asyncio.run(
+        generate_openai_rewrite_pairs(
+            resolve_path(messages),
+            resolve_path(output),
+            resolve_path(report),
+            api_key=api_key,
+            model=model_name,
+            limit=limit,
+            batch_size=batch_size,
+            concurrency=concurrency,
+            max_characters=max_characters,
+        )
+    )
+    _emit(generation_report)
+    if generation_report["failed_batches"]:
+        raise typer.Exit(code=1)
+
+
+@app.command("review-rewrite-pairs")
+def review_rewrite_pairs_command(
+    pairs: Annotated[Path, typer.Option(help="Private generated pair JSONL")] = Path(
+        "work/rewrite/pairs.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Private Markdown review file")] = Path(
+        "work/rewrite/pilot-review.md"
+    ),
+    sample_size: Annotated[int, typer.Option(min=1)] = 50,
+) -> None:
+    """Create a private, evenly sampled human-review document."""
+    _emit(
+        create_rewrite_review(
+            resolve_path(pairs),
+            resolve_path(output),
+            sample_size=sample_size,
+        )
+    )
+
+
 @app.command("train-tokenizer")
 def train_tokenizer_command(
     train: Annotated[Path, typer.Option(help="Training JSONL only")] = Path(
@@ -212,6 +317,58 @@ def corpus_stats_command(
     _emit({"tokens": token_report, "selection": selection})
 
 
+@app.command("rewrite-corpus-stats")
+def rewrite_corpus_stats_command(
+    splits: Annotated[Path, typer.Option(help="Rewrite JSONL split directory")] = Path(
+        "work/rewrite/splits"
+    ),
+    tokenizer: Annotated[Path, typer.Option(help="Rewrite tokenizer directory")] = Path(
+        "outputs/rewrite-tokenizer"
+    ),
+    output: Annotated[Path, typer.Option(help="Encoded rewrite array directory")] = Path(
+        "work/rewrite/tokens"
+    ),
+    config: Annotated[Path, typer.Option(help="Rewrite model configuration")] = Path(
+        "configs/model-rewrite-190k.yaml"
+    ),
+    selection_report: Annotated[Path, typer.Option(help="Rewrite model-selection report")] = Path(
+        "work/rewrite/reports/model-selection.json"
+    ),
+) -> None:
+    """Encode rewrite pairs with target masks and report supervised token counts."""
+    training_config = load_yaml(config)
+    tokenizer_path = resolve_path(tokenizer)
+    tokenizer_report_path = tokenizer_path / "training-report.json"
+    if not tokenizer_report_path.exists():
+        raise typer.BadParameter("Rewrite tokenizer is missing its training report")
+    tokenizer_training_report = json.loads(tokenizer_report_path.read_text(encoding="utf-8"))
+    if int(tokenizer_training_report.get("requested_vocab_size", 0)) != 2048:
+        raise typer.BadParameter(
+            "Rewrite models require a tokenizer trained with `--vocab-size 2048`"
+        )
+    token_report = encode_all_rewrite_splits(
+        resolve_path(splits),
+        tokenizer_path,
+        resolve_path(output),
+        context_length=int(training_config["max_sequence_length"]),
+    )
+    tokenizer_value = load_tokenizer(tokenizer_path)
+    candidate_configs = [
+        load_yaml("configs/model-rewrite-190k.yaml"),
+        load_yaml("configs/model-rewrite-290k.yaml"),
+    ]
+    selection = select_rewrite_model(
+        int(token_report["train"]["supervised_tokens"]),
+        int(token_report["train"]["pairs"]),
+        tokenizer_value.get_vocab_size(),
+        candidate_configs,
+    )
+    selection["token_basis"] = "supervised target tokens"
+    selection["requested_vocab_size"] = int(tokenizer_training_report["requested_vocab_size"])
+    write_json(resolve_path(selection_report), selection)
+    _emit({"tokens": token_report, "selection": selection})
+
+
 @app.command("train")
 def train_command(
     config: Annotated[Path, typer.Option(help="Model/training configuration")],
@@ -230,15 +387,63 @@ def train_command(
 ) -> None:
     """Train a decoder-only Transformer from random initialization with MLX."""
     training_config = load_yaml(config)
+    expected_task = str(training_config.get("task", "reply"))
+    if expected_task not in {"reply", "rewrite"}:
+        raise typer.BadParameter(f"Unsupported training task {expected_task!r}.")
+    expected_objective = "target_only" if expected_task == "rewrite" else "causal"
+    if training_config.get("objective", "causal") != expected_objective:
+        raise typer.BadParameter(
+            f"Task {expected_task!r} requires objective {expected_objective!r}."
+        )
     selection_path = resolve_path(selection_report)
+    tokenizer_path = resolve_path(tokenizer)
     if training_config.get("name") != "smoke":
         if not selection_path.exists():
+            stats_command = "rewrite-corpus-stats" if expected_task == "rewrite" else "corpus-stats"
             raise typer.BadParameter(
-                "Run `imessage-mlx corpus-stats` before real training; the model size must be "
+                f"Run `imessage-mlx {stats_command}` before real training; the model size must be "
                 "selected from the local token count."
             )
         selection = json.loads(selection_path.read_text(encoding="utf-8"))
-        if not selection.get("enough_tokens_to_train", False):
+        selected_task = str(selection.get("task", "reply"))
+        if selected_task != expected_task:
+            raise typer.BadParameter(
+                f"Training config requires task {expected_task!r}, but the selection report is "
+                f"for {selected_task!r}."
+            )
+        if expected_task == "rewrite":
+            if (
+                selection.get("schema_version") != 1
+                or selection.get("selection_scope") != "training_split"
+            ):
+                raise typer.BadParameter(
+                    "Rewrite selection report is outdated; rerun `imessage-mlx "
+                    "rewrite-corpus-stats`."
+                )
+            if not selection.get("eligible_to_train", False):
+                raise typer.BadParameter(
+                    "Rewrite training data does not satisfy the recorded pair, supervised-token, "
+                    "and tokens-per-parameter safety gates."
+                )
+            if int(training_config.get("vocab_size", 0)) != 2048:
+                raise typer.BadParameter("Rewrite model configs require a 2,048-token vocabulary")
+            tokenizer_training_report_path = tokenizer_path / "training-report.json"
+            if not tokenizer_training_report_path.exists():
+                raise typer.BadParameter("Rewrite tokenizer is missing its training report")
+            tokenizer_training_report = json.loads(
+                tokenizer_training_report_path.read_text(encoding="utf-8")
+            )
+            if int(tokenizer_training_report.get("requested_vocab_size", 0)) != 2048:
+                raise typer.BadParameter(
+                    "Rewrite models require a tokenizer trained with `--vocab-size 2048`"
+                )
+            actual_vocab_size = load_tokenizer(tokenizer_path).get_vocab_size()
+            if int(selection.get("vocab_size", -1)) != actual_vocab_size:
+                raise typer.BadParameter(
+                    "Rewrite tokenizer differs from the model-selection report; rerun "
+                    "`imessage-mlx rewrite-corpus-stats`."
+                )
+        elif not selection.get("enough_tokens_to_train", False):
             raise typer.BadParameter(
                 "The training split has fewer than one million tokens. The safety gate forbids "
                 "claiming a meaningful from-scratch training run."
@@ -251,7 +456,7 @@ def train_command(
     summary = train_model(
         training_config,
         resolve_path(data),
-        resolve_path(tokenizer),
+        tokenizer_path,
         resolve_path(output),
         resume_from=resolve_path(resume_from) if resume_from else None,
         compile_step=compile_step,
@@ -277,17 +482,21 @@ def export_command(
     output: Annotated[Path, typer.Option(help="Final private model directory")] = Path(
         "outputs/final"
     ),
-    metrics: Annotated[Path, typer.Option(help="Evaluation metrics JSON")] = Path(
-        "outputs/evaluation.json"
+    metrics: Annotated[Path | None, typer.Option(help="Evaluation metrics JSON")] = None,
+    split_report: Annotated[Path, typer.Option(help="Data split report")] = Path(
+        "work/reports/split-report.json"
+    ),
+    splits: Annotated[Path, typer.Option(help="Source JSONL split directory")] = Path(
+        "work/splits"
     ),
 ) -> None:
     """Export the inference-only local artifact."""
     manifest = export_model(
         resolve_path(checkpoint),
         resolve_path(output),
-        metrics_path=resolve_path(metrics),
-        split_report_path=resolve_path("work/reports/split-report.json"),
-        split_dir=resolve_path("work/splits"),
+        metrics_path=resolve_path(metrics) if metrics else None,
+        split_report_path=resolve_path(split_report),
+        split_dir=resolve_path(splits),
     )
     _emit(manifest)
 
@@ -331,6 +540,32 @@ def chat_command(
             typer.echo(chunk, nl=False)
         typer.echo()
         history.extend([("other", incoming), ("me", "".join(chunks))])
+
+
+@app.command("rewrite")
+def rewrite_command(
+    neutral_draft: Annotated[str, typer.Argument(help="Neutral draft to rewrite")],
+    model: Annotated[Path, typer.Option(help="Exported rewrite model directory")] = Path(
+        "outputs/rewrite-final"
+    ),
+    max_new_tokens: Annotated[int, typer.Option(min=1, max=512)] = 64,
+    temperature: Annotated[float, typer.Option(min=0.0)] = 0.5,
+    top_p: Annotated[float, typer.Option(min=0.0, max=1.0)] = 0.8,
+    repetition_penalty: Annotated[float, typer.Option(min=0.1)] = 1.1,
+    seed: int = 42,
+) -> None:
+    """Rewrite a neutral draft in the locally trained casual text style."""
+    typer.echo(
+        generate_rewrite(
+            resolve_path(model),
+            neutral_draft,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            seed=seed,
+        )
+    )
 
 
 @app.command("audit")

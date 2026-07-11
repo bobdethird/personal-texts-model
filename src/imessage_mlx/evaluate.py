@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 from typing import Any
@@ -94,6 +95,15 @@ def evaluate_checkpoint(
     generation_samples: int = 20,
 ) -> dict[str, Any]:
     checkpoint_path = Path(checkpoint)
+    training_config_path = checkpoint_path / "training-config.json"
+    if training_config_path.exists():
+        training_config = json.loads(training_config_path.read_text(encoding="utf-8"))
+        task = str(training_config.get("task", "reply"))
+        if task != "reply":
+            raise ValueError(
+                "The current evaluator supports reply checkpoints only; "
+                "rewrite metrics require target masks"
+            )
     model = load_model(checkpoint_path)
     tokenizer = load_tokenizer(checkpoint_path / "tokenizer")
     data_path = Path(data_dir)
@@ -152,6 +162,7 @@ def evaluate_checkpoint(
         longest_match = max(longest_match, current_longest)
 
     report = {
+        "task": "reply",
         "parameter_count": model.parameter_count,
         "context_length": context,
         "train_tokens": int(train.size),
