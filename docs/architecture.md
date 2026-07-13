@@ -26,6 +26,12 @@ database identities with keyed HMAC pseudonyms.
 9. `rewrite.py` validates neutral-to-styled pairs and serializes the separate rewrite task.
 10. `pair_generation.py` optionally asks OpenAI to neutralize recent outgoing messages in resumable,
     structured batches without logging message text.
+11. `adapters.py` converts chronological pairs into BART source/target and MLX-LM
+    prompt/completion records, removes normalized and fuzzy cross-split duplicates, reports signal
+    strata, filters deterministic fact conflicts and length outliers, caps exact/surface-only
+    examples, and writes a frozen architecture-benchmark subset.
+12. `repair.py` can reconstruct only low-signal pairs through blinded semantic JSON. Failed fact,
+    schema, or content checks retain the original pair.
 
 Splitting complete sessions before tokenizer training prevents adjacent messages or overlapping
 windows from leaking across train, validation, and test data. The tokenizer sees only the training
@@ -56,7 +62,9 @@ Reply models request a 4,096-token vocabulary; the smaller rewrite models reques
 - Residual connections
 - Strict configured context length
 
-The model is initialized randomly. No external weights or tokenizer are downloaded.
+The reply model and legacy tiny rewrite baseline are initialized randomly. The recommended rewrite
+path instead trains a low-rank adapter over a checksum-cached pretrained base model. Base weights
+remain separate from the sensitive local adapter.
 
 ## Training
 
@@ -78,10 +86,35 @@ the styled target and its turn terminator; prompt and padding tokens do not affe
 Reply models retain the original unmasked causal objective. Rewrite and reply models are exported as
 separate artifacts.
 
+The adapter path benchmarks two isolated environments against the same frozen records:
+
+- BART-base uses PEFT `SEQ_2_SEQ_LM` LoRA on MPS. The encoder receives the complete neutral draft
+  and the decoder learns only the styled target.
+- Qwen3-0.6B-4bit uses MLX-LM QLoRA with `--mask-prompt`, so instruction and draft tokens do not
+  contribute to loss.
+
+The environments live under ignored `work/envs/` and do not change the pinned custom-model
+environment. Training uses deterministic seeds, small batches, gradient accumulation, validation,
+best-adapter saves, and early stopping. BART applies an exact 256-token source/target guard before
+training; MLX-LM receives the same maximum sequence length. Adapters are neither fused nor uploaded.
+
+Multi-register convergence is a separate v1 data contract layered onto the accepted BART splits.
+Targets are selected deterministically within their existing train/validation/test assignment.
+OpenAI Stage A extracts typed semantics from the target; a separate Stage B request receives only
+the semantic object and emits exactly four labeled sources. The manifest fingerprints the input
+files, model, prompts, schemas, and style set. Semantics and variants checkpoint independently, while
+only complete target groups are published.
+
+Each generated row carries `target_id`, `source_pair_id`, `variant_kind`, and `split`. Adapter
+deduplication treats repeated targets from the same owner group as intentional but rejects matches
+owned by another group or split. Local sentence-transformer scoring runs before dataset assembly.
+The pilot uses all four rows and reports effective target exposure; larger runs must reconsider a
+group-aware rotating sampler if memorization rises.
+
 Model selection is task-specific. Reply selection retains its original one-million-token hard
 minimum and ten-token-per-parameter heuristic. Rewrite selection considers only the training split,
 requires at least 10,000 unique pairs and 100,000 supervised target tokens, then selects the largest
-rewrite candidate with at least two supervised target tokens per parameter. It returns no model
+rewrite candidate with at least 1.5 supervised target tokens per parameter. It returns no model
 when the gates fail. The rewrite presets are approximately 188K and 291K parameters at a full
 2,048-token vocabulary.
 
@@ -105,11 +138,22 @@ validation loss, dependency versions, compilation mode, and random-initializatio
 
 `src/imessage_mlx/evaluate.py` measures validation and untouched-test loss, overall and `me`-turn
 perplexity, a unigram baseline, token n-gram overlap with training data, and obvious-PII patterns in
-sampled generations. It stores aggregate counts only.
+sampled generations for reply models. `src/imessage_mlx/rewrite_evaluation.py` separately evaluates
+rewrite predictions with local embedding similarity, protected-fact preservation, a held-out
+character-style classifier, style-marker gap closure, malformed/repetition rates, and exact
+training-target matches. Reports store aggregate values, never matched text.
+
+`src/imessage_mlx/convergence_evaluation.py` validates complete four-register groups, then reports
+protected facts, target/source similarity, normalized input copying, style distance and variance,
+within-target output agreement, worst-register behavior, fluency, and training-target memorization.
+Baseline and pilot reports must have the same challenge fingerprint. Expansion uses explicit gates
+rather than a weighted score and still requires a private grouped human review.
 
 `src/imessage_mlx/export.py` creates an inference-only artifact containing model weights,
 configuration, tokenizer, task capabilities, metrics, and split hashes. Optimizer state and source
-text are excluded.
+text are excluded. Adapter export additionally records pretrained-base provenance, adapter hashes,
+model license, deterministic generation defaults, no-upload/no-auto-send warnings, and a
+timestamped rollback artifact when replacing a prior promotion.
 
 `src/imessage_mlx/audit.py` rechecks the complete Gate A-D evidence, test suite, private file
 permissions, Git exclusions, artifact hash, and fresh-process chat command.

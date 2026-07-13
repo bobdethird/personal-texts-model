@@ -12,6 +12,7 @@ from imessage_mlx.dataset import (
     select_rewrite_model,
 )
 from imessage_mlx.tokenizer.train import load_tokenizer, train_tokenizer
+from imessage_mlx.utils import write_jsonl
 
 
 def _prepared_pairs(tmp_path: Path) -> tuple[Path, Path]:
@@ -62,6 +63,43 @@ def test_rewrite_encoding_rejects_pair_larger_than_context(tmp_path: Path) -> No
         )
 
 
+def test_rewrite_encoding_can_report_and_skip_oversized_pairs(tmp_path: Path) -> None:
+    source = tmp_path / "pairs.jsonl"
+    write_jsonl(
+        source,
+        [
+            {
+                "pair_id": "short",
+                "timestamp_ns": 1,
+                "neutral_text": "Are you free?",
+                "styled_text": "u free?",
+            },
+            {
+                "pair_id": "long",
+                "timestamp_ns": 2,
+                "neutral_text": "x" * 500,
+                "styled_text": "y" * 500,
+            },
+        ],
+    )
+    processed = tmp_path / "processed.jsonl"
+    build_rewrite_pairs(source, processed, tmp_path / "report.json")
+    tokenizer_dir = tmp_path / "tokenizer"
+    train_tokenizer(processed, tokenizer_dir, vocab_size=256, minimum_frequency=1)
+
+    report = encode_rewrite_split(
+        processed,
+        tokenizer_dir,
+        tmp_path / "tokens.npy",
+        tmp_path / "loss-mask.npy",
+        context_length=96,
+        skip_oversized=True,
+    )
+
+    assert report["pairs"] == 1
+    assert report["skipped_oversized_pairs"] == 1
+
+
 def _candidate(name: str, hidden_size: int) -> dict[str, object]:
     return {
         "name": name,
@@ -90,7 +128,7 @@ def test_rewrite_selection_uses_exact_ratio_and_largest_eligible_candidate() -> 
     small = _candidate("small", 16)
     large = _candidate("large", 24)
     large_parameters = estimate_parameter_count(large, 256)
-    exact_tokens = large_parameters * 2
+    exact_tokens = large_parameters * 3 // 2
 
     report = select_rewrite_model(
         exact_tokens,
@@ -102,7 +140,7 @@ def test_rewrite_selection_uses_exact_ratio_and_largest_eligible_candidate() -> 
 
     assert report["selected"] == "large"
     assert report["eligible_to_train"] is True
-    assert report["candidates"][1]["supervised_target_tokens_per_parameter"] == 2.0
+    assert report["candidates"][1]["supervised_target_tokens_per_parameter"] == 1.5
     below_ratio = select_rewrite_model(
         exact_tokens - 1,
         10_000,

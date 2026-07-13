@@ -10,6 +10,28 @@ from typing import Any
 from imessage_mlx.utils import ensure_private_dir, sha256_file, write_json
 
 
+def export_adapter(
+    adapter_dir: str | Path,
+    evaluation_report_path: str | Path,
+    output_dir: str | Path,
+    *,
+    config_path: str | Path | None = None,
+    data_report_path: str | Path | None = None,
+    architecture_report_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Export a passing pretrained adapter with provenance and rollback metadata."""
+    from imessage_mlx.adapter_runtime import promote_adapter
+
+    return promote_adapter(
+        adapter_dir,
+        evaluation_report_path,
+        output_dir,
+        config_path=config_path,
+        data_report_path=data_report_path,
+        architecture_report_path=architecture_report_path,
+    )
+
+
 def export_model(
     checkpoint: str | Path,
     output_dir: str | Path,
@@ -38,7 +60,7 @@ def export_model(
         shutil.copytree(checkpoint_path / "tokenizer", temporary / "tokenizer")
         generation_config = {
             "max_new_tokens": 64,
-            "temperature": 0.5 if task == "rewrite" else 0.8,
+            "temperature": 0.0 if task == "rewrite" else 0.8,
             "top_p": 0.8 if task == "rewrite" else 0.9,
             "repetition_penalty": 1.1,
             "stop_tokens": ["<|turn_end|>", "<|eos|>"],

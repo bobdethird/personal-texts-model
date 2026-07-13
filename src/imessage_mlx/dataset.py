@@ -62,6 +62,7 @@ def encode_rewrite_split(
     mask_output_path: str | Path,
     *,
     context_length: int,
+    skip_oversized: bool = False,
 ) -> dict[str, Any]:
     tokenizer = load_tokenizer(tokenizer_path)
     pad_id = tokenizer.token_to_id("<|pad|>")
@@ -84,6 +85,7 @@ def encode_rewrite_split(
     current_tokens: list[int] = []
     current_mask: list[int] = []
     pair_count = 0
+    skipped_oversized_pairs = 0
     source_tokens = 0
     supervised_tokens = 0
 
@@ -111,6 +113,9 @@ def encode_rewrite_split(
         pair_tokens = [*prompt_ids, *target_ids, *suffix_ids]
         pair_mask = [*([0] * len(prompt_ids)), *([1] * len(target_ids)), *([0] * len(suffix_ids))]
         if len(pair_tokens) > block_size:
+            if skip_oversized:
+                skipped_oversized_pairs += 1
+                continue
             raise ValueError(
                 f"Rewrite pair {pair_id!r} requires {len(pair_tokens)} tokens, "
                 f"exceeding block size {block_size}"
@@ -138,6 +143,7 @@ def encode_rewrite_split(
     mask_destination.chmod(0o600)
     return {
         "pairs": pair_count,
+        "skipped_oversized_pairs": skipped_oversized_pairs,
         "windows": len(token_blocks),
         "tokens": source_tokens,
         "encoded_tokens": int(token_array.size),
@@ -162,6 +168,7 @@ def encode_all_rewrite_splits(
             output / f"{name}.npy",
             output / f"{name}-loss-mask.npy",
             context_length=context_length,
+            skip_oversized=True,
         )
         for name in ("train", "validation", "test")
     }
@@ -272,7 +279,7 @@ def select_rewrite_model(
     *,
     minimum_train_tokens: int = 100_000,
     minimum_train_pairs: int = 10_000,
-    minimum_tokens_per_parameter: float = 2.0,
+    minimum_tokens_per_parameter: float = 1.5,
 ) -> dict[str, Any]:
     if not candidate_configs:
         raise ValueError("At least one rewrite model candidate is required")

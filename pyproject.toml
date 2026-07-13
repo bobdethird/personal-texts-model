@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "texts-to-transformer"
 version = "0.1.0"
-description = "Train a tiny Transformer from scratch on your iMessage history, entirely on your Mac"
+description = "Train private iMessage reply models and local rewrite adapters on Apple silicon"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
@@ -22,8 +22,8 @@ dependencies = [
 [project.scripts]
 imessage-mlx = "imessage_mlx.cli:app"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
   "pytest>=8,<10",
   "pytest-cov>=6,<8",
   "ruff>=0.12,<1",

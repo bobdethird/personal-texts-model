@@ -13,8 +13,27 @@ import mlx.core as mx
 import typer
 from dotenv import load_dotenv
 
+from imessage_mlx.adapter_runtime import (
+    evaluate_semantics,
+    predict_adapter,
+    repair_pairs_locally,
+    rewrite_with_adapter,
+    setup_adapter_environment,
+    train_adapter,
+    validate_convergence_data_semantics,
+)
 from imessage_mlx.audit import completion_audit
 from imessage_mlx.config import load_yaml, resolve_path
+from imessage_mlx.convergence_evaluation import (
+    compare_convergence_evaluations,
+    create_convergence_comparison_review,
+    evaluate_convergence_predictions,
+)
+from imessage_mlx.data.adapters import (
+    prepare_adapter_datasets,
+    prepare_convergence_adapter_datasets,
+)
+from imessage_mlx.data.convergence_generation import generate_openai_convergence_data
 from imessage_mlx.data.extract import extract_messages
 from imessage_mlx.data.inspect_schema import inspect_schema
 from imessage_mlx.data.pair_generation import (
@@ -33,8 +52,14 @@ from imessage_mlx.dataset import (
     select_rewrite_model,
 )
 from imessage_mlx.evaluate import evaluate_checkpoint
-from imessage_mlx.export import export_model
+from imessage_mlx.export import export_adapter, export_model
 from imessage_mlx.generate import generate_rewrite, stream_reply
+from imessage_mlx.rewrite_evaluation import (
+    compare_rewrite_evaluations,
+    create_rewrite_comparison_review,
+    evaluate_rewrite_predictions,
+    predict_legacy_rewrite,
+)
 from imessage_mlx.tokenizer.train import load_tokenizer, train_tokenizer
 from imessage_mlx.train import train_model
 from imessage_mlx.utils import ensure_private_dir, write_json
@@ -200,6 +225,513 @@ def prepare_rewrites_command(
         guard_days=guard_days,
     )
     _emit(report)
+
+
+@app.command("prepare-adapters")
+def prepare_adapters_command(
+    splits: Annotated[Path, typer.Option(help="Chronological rewrite split directory")] = Path(
+        "work/rewrite/splits"
+    ),
+    output: Annotated[Path, typer.Option(help="Private adapter dataset directory")] = Path(
+        "work/rewrite/adapters"
+    ),
+    report: Annotated[Path, typer.Option(help="Private adapter data report")] = Path(
+        "work/rewrite/reports/adapter-data.json"
+    ),
+    benchmark_train_size: Annotated[int, typer.Option(min=1)] = 2_000,
+    benchmark_eval_size: Annotated[int, typer.Option(min=1)] = 200,
+    max_characters: Annotated[int, typer.Option(min=1)] = 512,
+) -> None:
+    """Build leakage-clean BART and MLX-LM adapter datasets."""
+    _emit(
+        prepare_adapter_datasets(
+            resolve_path(splits),
+            resolve_path(output),
+            resolve_path(report),
+            benchmark_train_size=benchmark_train_size,
+            benchmark_eval_size=benchmark_eval_size,
+            max_characters=max_characters,
+        )
+    )
+
+
+@app.command("generate-convergence-pilot")
+def generate_convergence_pilot_command(
+    splits: Annotated[Path, typer.Option(help="Accepted BART adapter split directory")] = Path(
+        "work/rewrite/adapters/bart"
+    ),
+    output: Annotated[Path, typer.Option(help="Private convergence generation directory")] = Path(
+        "work/rewrite/convergence/pilot"
+    ),
+    report: Annotated[Path, typer.Option(help="Private aggregate generation report")] = Path(
+        "work/rewrite/convergence/pilot-report.json"
+    ),
+    model: Annotated[str | None, typer.Option(help="OpenAI model ID")] = None,
+    train_targets: Annotated[int, typer.Option(min=0)] = 400,
+    validation_targets: Annotated[int, typer.Option(min=0)] = 50,
+    test_targets: Annotated[int, typer.Option(min=0)] = 50,
+    reserve_per_split: Annotated[int | None, typer.Option(min=0)] = None,
+    max_characters: Annotated[int, typer.Option(min=1)] = 512,
+    concurrency: Annotated[int, typer.Option(min=1, max=20)] = 4,
+    max_variant_attempts: Annotated[int, typer.Option(min=1, max=5)] = 2,
+) -> None:
+    """Generate resumable, wording-blind multi-register inputs through OpenAI."""
+    load_dotenv()
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise typer.BadParameter("Set OPENAI_API_KEY in the environment or ignored .env file")
+    model_name = model or os.environ.get("OPENAI_MODEL", "gpt-5.5")
+    generation_report = asyncio.run(
+        generate_openai_convergence_data(
+            resolve_path(splits),
+            resolve_path(output),
+            resolve_path(report),
+            api_key=api_key,
+            model=model_name,
+            allocation={
+                "train": train_targets,
+                "valid": validation_targets,
+                "test": test_targets,
+            },
+            reserve_per_split=reserve_per_split,
+            max_characters=max_characters,
+            concurrency=concurrency,
+            max_variant_attempts=max_variant_attempts,
+        )
+    )
+    _emit(generation_report)
+    if generation_report["variants"]["incomplete_active_groups"] or (
+        generation_report["selection"]["active"]
+        != generation_report["selection"]["requested"]
+    ):
+        raise typer.Exit(code=1)
+
+
+@app.command("validate-convergence-data-semantics")
+def validate_convergence_data_semantics_command(
+    environment: Annotated[Path, typer.Option(help="BART evaluation virtual environment")],
+    pairs: Annotated[Path, typer.Option(help="Generated convergence pair JSONL")] = Path(
+        "work/rewrite/convergence/pilot/published.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Pairs with local semantic scores")] = Path(
+        "work/rewrite/convergence/pilot/semantic-validated.jsonl"
+    ),
+    report: Annotated[Path, typer.Option(help="Aggregate semantic validation report")] = Path(
+        "work/rewrite/convergence/pilot-semantic-report.json"
+    ),
+    minimum_similarity: Annotated[float, typer.Option(min=-1.0, max=1.0)] = 0.25,
+) -> None:
+    """Score generated source-to-target meaning preservation locally."""
+    _emit(
+        validate_convergence_data_semantics(
+            resolve_path(pairs),
+            resolve_path(output),
+            resolve_path(report),
+            resolve_path(environment),
+            minimum_similarity=minimum_similarity,
+            project_root=Path.cwd(),
+        )
+    )
+
+
+@app.command("prepare-convergence-adapters")
+def prepare_convergence_adapters_command(
+    base: Annotated[Path, typer.Option(help="Existing accepted BART data directory")] = Path(
+        "work/rewrite/adapters/bart"
+    ),
+    pairs: Annotated[Path, typer.Option(help="Semantically scored convergence pairs")] = Path(
+        "work/rewrite/convergence/pilot/semantic-validated.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Augmented private adapter data root")] = Path(
+        "work/rewrite/convergence/adapters"
+    ),
+    report: Annotated[Path, typer.Option(help="Convergence adapter data report")] = Path(
+        "work/rewrite/convergence/adapter-data-report.json"
+    ),
+    minimum_similarity: Annotated[float, typer.Option(min=-1.0, max=1.0)] = 0.25,
+    minimum_group_mean: Annotated[float, typer.Option(min=-1.0, max=1.0)] = 0.50,
+) -> None:
+    """Merge complete convergence groups into leakage-clean BART data."""
+    _emit(
+        prepare_convergence_adapter_datasets(
+            resolve_path(base),
+            resolve_path(pairs),
+            resolve_path(output),
+            resolve_path(report),
+            minimum_semantic_similarity=minimum_similarity,
+            minimum_group_mean_similarity=minimum_group_mean,
+        )
+    )
+
+
+@app.command("setup-adapter-environment")
+def setup_adapter_environment_command(
+    architecture: Annotated[str, typer.Argument(help="Adapter architecture: bart or qwen")],
+    output: Annotated[Path, typer.Option(help="Private isolated virtual environment")],
+) -> None:
+    """Install an isolated local adapter-training environment."""
+    _emit(
+        setup_adapter_environment(
+            architecture,
+            resolve_path(output),
+            project_root=Path.cwd(),
+        )
+    )
+
+
+@app.command("train-adapter")
+def train_adapter_command(
+    config: Annotated[Path, typer.Option(help="Adapter configuration YAML")],
+    environment: Annotated[Path, typer.Option(help="Isolated adapter virtual environment")],
+    data: Annotated[Path, typer.Option(help="Prepared adapter dataset root")] = Path(
+        "work/rewrite/adapters"
+    ),
+    output: Annotated[Path, typer.Option(help="Private adapter run directory")] = Path(
+        "outputs/adapters/run"
+    ),
+    benchmark: Annotated[
+        bool, typer.Option(help="Use the small architecture benchmark split")
+    ] = False,
+) -> None:
+    """Train a local BART LoRA or Qwen QLoRA adapter."""
+    _emit(
+        train_adapter(
+            resolve_path(config),
+            resolve_path(data),
+            resolve_path(output),
+            resolve_path(environment),
+            benchmark=benchmark,
+            project_root=Path.cwd(),
+        )
+    )
+
+
+@app.command("predict-adapter")
+def predict_adapter_command(
+    config: Annotated[Path, typer.Option(help="Adapter configuration YAML")],
+    environment: Annotated[Path, typer.Option(help="Isolated adapter virtual environment")],
+    adapter: Annotated[Path, typer.Option(help="Private adapter run directory")],
+    data: Annotated[Path, typer.Option(help="Prepared adapter dataset root")] = Path(
+        "work/rewrite/adapters"
+    ),
+    output: Annotated[Path, typer.Option(help="Private prediction JSONL")] = Path(
+        "work/rewrite/evaluation/predictions.jsonl"
+    ),
+    benchmark: Annotated[
+        bool, typer.Option(help="Use the small architecture benchmark split")
+    ] = False,
+    test_file: Annotated[
+        Path | None, typer.Option(help="Optional explicit BART or MLX test JSONL")
+    ] = None,
+) -> None:
+    """Generate held-out predictions from a local adapter."""
+    _emit(
+        predict_adapter(
+            resolve_path(config),
+            resolve_path(data),
+            resolve_path(adapter),
+            resolve_path(output),
+            resolve_path(environment),
+            benchmark=benchmark,
+            data_file=resolve_path(test_file) if test_file else None,
+            project_root=Path.cwd(),
+        )
+    )
+
+
+@app.command("evaluate-rewrite-adapter")
+def evaluate_rewrite_adapter_command(
+    predictions: Annotated[Path, typer.Option(help="Private adapter prediction JSONL")],
+    train: Annotated[Path, typer.Option(help="Private original training split")] = Path(
+        "work/rewrite/splits/train.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Private rewrite evaluation report")] = Path(
+        "work/rewrite/evaluation/report.json"
+    ),
+    semantic_report: Annotated[
+        Path | None, typer.Option(help="Optional private local semantic-similarity report")
+    ] = None,
+) -> None:
+    """Evaluate content preservation, style transfer, fluency, and memorization."""
+    _emit(
+        evaluate_rewrite_predictions(
+            resolve_path(predictions),
+            resolve_path(train),
+            resolve_path(output),
+            semantic_report_path=resolve_path(semantic_report) if semantic_report else None,
+        )
+    )
+
+
+@app.command("predict-legacy-rewrite")
+def predict_legacy_rewrite_command(
+    model: Annotated[Path, typer.Option(help="Exported legacy rewrite model")] = Path(
+        "outputs/rewrite-final"
+    ),
+    test: Annotated[Path, typer.Option(help="Private chronological rewrite test split")] = Path(
+        "work/rewrite/splits/test.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Private prediction JSONL")] = Path(
+        "work/rewrite/evaluation/legacy-291k.jsonl"
+    ),
+    limit: Annotated[int | None, typer.Option(min=1)] = None,
+) -> None:
+    """Generate deterministic held-out predictions from the current tiny rewrite model."""
+    _emit(
+        predict_legacy_rewrite(
+            resolve_path(model),
+            resolve_path(test),
+            resolve_path(output),
+            limit=limit,
+        )
+    )
+
+
+@app.command("evaluate-rewrite-semantics")
+def evaluate_rewrite_semantics_command(
+    predictions: Annotated[Path, typer.Option(help="Private adapter prediction JSONL")],
+    environment: Annotated[Path, typer.Option(help="BART evaluation virtual environment")],
+    output: Annotated[Path, typer.Option(help="Private aggregate semantic report")] = Path(
+        "work/rewrite/evaluation/semantic-report.json"
+    ),
+) -> None:
+    """Compute private local embedding similarities without persisting message text."""
+    _emit(
+        evaluate_semantics(
+            resolve_path(predictions),
+            resolve_path(output),
+            resolve_path(environment),
+            project_root=Path.cwd(),
+        )
+    )
+
+
+@app.command("evaluate-convergence-adapter")
+def evaluate_convergence_adapter_command(
+    predictions: Annotated[Path, typer.Option(help="Grouped convergence predictions")],
+    train: Annotated[
+        Path, typer.Option(help="Adapter training JSONL for memorization checks")
+    ] = Path("work/rewrite/convergence/adapters/bart/train.jsonl"),
+    output: Annotated[Path, typer.Option(help="Private convergence evaluation report")] = Path(
+        "work/rewrite/convergence/evaluation/report.json"
+    ),
+    semantic_report: Annotated[
+        Path | None, typer.Option(help="Optional local prediction semantic report")
+    ] = None,
+) -> None:
+    """Evaluate four-register content, copying, style, and convergence."""
+    _emit(
+        evaluate_convergence_predictions(
+            resolve_path(predictions),
+            resolve_path(train),
+            resolve_path(output),
+            semantic_report_path=resolve_path(semantic_report) if semantic_report else None,
+        )
+    )
+
+
+@app.command("compare-convergence-pilot")
+def compare_convergence_pilot_command(
+    baseline: Annotated[Path, typer.Option(help="Current adapter convergence report")],
+    augmented: Annotated[Path, typer.Option(help="Pilot adapter convergence report")],
+    output: Annotated[Path, typer.Option(help="Expansion gate report")] = Path(
+        "work/rewrite/convergence/evaluation/pilot-comparison.json"
+    ),
+    baseline_semantic: Annotated[
+        Path | None, typer.Option(help="Current adapter local semantic report")
+    ] = None,
+    augmented_semantic: Annotated[
+        Path | None, typer.Option(help="Pilot adapter local semantic report")
+    ] = None,
+) -> None:
+    """Apply explicit same-challenge pilot expansion gates."""
+    _emit(
+        compare_convergence_evaluations(
+            resolve_path(baseline),
+            resolve_path(augmented),
+            resolve_path(output),
+            baseline_semantic_report=(
+                resolve_path(baseline_semantic) if baseline_semantic else None
+            ),
+            augmented_semantic_report=(
+                resolve_path(augmented_semantic) if augmented_semantic else None
+            ),
+        )
+    )
+
+
+@app.command("review-convergence-models")
+def review_convergence_models_command(
+    baseline: Annotated[Path, typer.Option(help="Current adapter convergence predictions")],
+    augmented: Annotated[Path, typer.Option(help="Pilot adapter convergence predictions")],
+    output: Annotated[Path, typer.Option(help="Private grouped human review Markdown")] = Path(
+        "work/rewrite/convergence/reviews/pilot-comparison.md"
+    ),
+    summary: Annotated[Path | None, typer.Option(help="Private review summary JSON")] = None,
+    sample_size: Annotated[int, typer.Option(min=1, max=200)] = 50,
+) -> None:
+    """Create a private four-register comparison review."""
+    _emit(
+        create_convergence_comparison_review(
+            {
+                "Current BART LoRA": resolve_path(baseline),
+                "Convergence Pilot BART LoRA": resolve_path(augmented),
+            },
+            resolve_path(output),
+            summary_path=resolve_path(summary) if summary else None,
+            sample_size=sample_size,
+        )
+    )
+
+
+@app.command("compare-rewrite-evaluations")
+def compare_rewrite_evaluations_command(
+    bart: Annotated[Path, typer.Option(help="BART evaluation report")],
+    qwen: Annotated[Path, typer.Option(help="Qwen evaluation report")],
+    output: Annotated[Path, typer.Option(help="Private architecture decision report")] = Path(
+        "work/rewrite/evaluation/architecture-selection.json"
+    ),
+    legacy: Annotated[Path | None, typer.Option(help="Optional legacy evaluation report")] = None,
+    bart_training: Annotated[Path | None, typer.Option(help="BART training report")] = None,
+    qwen_training: Annotated[Path | None, typer.Option(help="Qwen training report")] = None,
+    bart_prediction_log: Annotated[Path | None, typer.Option(help="BART prediction log")] = None,
+    qwen_prediction_log: Annotated[Path | None, typer.Option(help="Qwen prediction log")] = None,
+) -> None:
+    """Select an architecture using held-out content, style, and fluency gates."""
+    reports: dict[str, Path] = {"bart": resolve_path(bart), "qwen": resolve_path(qwen)}
+    if legacy is not None:
+        reports["legacy_291k"] = resolve_path(legacy)
+    training = {
+        name: resolve_path(path)
+        for name, path in (("bart", bart_training), ("qwen", qwen_training))
+        if path is not None
+    }
+    prediction_logs = {
+        name: resolve_path(path)
+        for name, path in (
+            ("bart", bart_prediction_log),
+            ("qwen", qwen_prediction_log),
+        )
+        if path is not None
+    }
+    _emit(
+        compare_rewrite_evaluations(
+            reports,
+            resolve_path(output),
+            training_report_paths=training,
+            prediction_log_paths=prediction_logs,
+        )
+    )
+
+
+@app.command("review-rewrite-models")
+def review_rewrite_models_command(
+    adapter: Annotated[Path, typer.Option(help="Private adapter prediction JSONL")],
+    legacy: Annotated[Path, typer.Option(help="Private legacy prediction JSONL")],
+    output: Annotated[Path, typer.Option(help="Private human review Markdown")] = Path(
+        "work/rewrite/reviews/model-comparison.md"
+    ),
+    sample_size: Annotated[int, typer.Option(min=1, max=200)] = 50,
+) -> None:
+    """Create a private stratified human comparison of adapter and legacy rewrites."""
+    _emit(
+        create_rewrite_comparison_review(
+            {
+                "Pretrained BART LoRA": resolve_path(adapter),
+                "Legacy 291K Transformer": resolve_path(legacy),
+            },
+            resolve_path(output),
+            sample_size=sample_size,
+        )
+    )
+
+
+@app.command("promote-adapter")
+def promote_adapter_command(
+    adapter: Annotated[Path, typer.Option(help="Passing private adapter run directory")],
+    evaluation: Annotated[Path, typer.Option(help="Passing rewrite evaluation report")],
+    config: Annotated[Path, typer.Option(help="Pinned adapter configuration YAML")] = Path(
+        "configs/adapter-bart-base.yaml"
+    ),
+    data_report: Annotated[Path, typer.Option(help="Private adapter data report")] = Path(
+        "work/rewrite/reports/adapter-data.json"
+    ),
+    architecture_report: Annotated[
+        Path, typer.Option(help="Private architecture selection report")
+    ] = Path("work/rewrite/evaluation/architecture-selection.json"),
+    output: Annotated[Path, typer.Option(help="Promoted private adapter artifact")] = Path(
+        "outputs/rewrite-adapter-final"
+    ),
+) -> None:
+    """Promote an adapter only after its rewrite evaluation passes."""
+    _emit(
+        export_adapter(
+            resolve_path(adapter),
+            resolve_path(evaluation),
+            resolve_path(output),
+            config_path=resolve_path(config),
+            data_report_path=resolve_path(data_report),
+            architecture_report_path=resolve_path(architecture_report),
+        )
+    )
+
+
+@app.command("repair-rewrite-pairs-local")
+def repair_rewrite_pairs_local_command(
+    pairs: Annotated[Path, typer.Option(help="Private original rewrite pair JSONL")] = Path(
+        "work/rewrite/pairs-v2.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Private targeted-repair pair JSONL")] = Path(
+        "work/rewrite/pairs-targeted.jsonl"
+    ),
+    report: Annotated[Path, typer.Option(help="Private aggregate repair report")] = Path(
+        "work/rewrite/reports/targeted-repair.json"
+    ),
+    config: Annotated[Path, typer.Option(help="Local Qwen configuration")] = Path(
+        "configs/adapter-qwen3-0.6b.yaml"
+    ),
+    environment: Annotated[Path, typer.Option(help="Local MLX-LM environment")] = Path(
+        "work/envs/mlx-lm"
+    ),
+    limit: Annotated[int, typer.Option(min=1, max=500)] = 500,
+) -> None:
+    """Pilot blind two-stage semantic reconstruction on low-signal pairs."""
+    _emit(
+        repair_pairs_locally(
+            resolve_path(config),
+            resolve_path(pairs),
+            resolve_path(output),
+            resolve_path(report),
+            resolve_path(environment),
+            limit=limit,
+            project_root=Path.cwd(),
+        )
+    )
+
+
+@app.command("rewrite-adapter")
+def rewrite_adapter_command(
+    neutral_draft: Annotated[str, typer.Argument(help="Neutral draft to rewrite")],
+    config: Annotated[Path, typer.Option(help="Adapter configuration YAML")] = Path(
+        "configs/adapter-bart-base.yaml"
+    ),
+    adapter: Annotated[Path, typer.Option(help="Promoted or training adapter directory")] = Path(
+        "outputs/rewrite-adapter-final"
+    ),
+    environment: Annotated[Path, typer.Option(help="Isolated adapter environment")] = Path(
+        "work/envs/bart"
+    ),
+) -> None:
+    """Rewrite one draft with deterministic local adapter inference."""
+    typer.echo(
+        rewrite_with_adapter(
+            neutral_draft,
+            resolve_path(config),
+            resolve_path(adapter),
+            resolve_path(environment),
+            project_root=Path.cwd(),
+        )
+    )
 
 
 @app.command("generate-rewrite-pairs")
@@ -549,7 +1081,7 @@ def rewrite_command(
         "outputs/rewrite-final"
     ),
     max_new_tokens: Annotated[int, typer.Option(min=1, max=512)] = 64,
-    temperature: Annotated[float, typer.Option(min=0.0)] = 0.5,
+    temperature: Annotated[float, typer.Option(min=0.0)] = 0.0,
     top_p: Annotated[float, typer.Option(min=0.0, max=1.0)] = 0.8,
     repetition_penalty: Annotated[float, typer.Option(min=0.1)] = 1.1,
     seed: int = 42,

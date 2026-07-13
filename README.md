@@ -1,13 +1,15 @@
 # Texts to Transformer
 
-Train a tiny language model from scratch on your iMessage history, entirely on your Mac.
+Train a tiny reply model or a pretrained personal rewrite adapter on your iMessage history,
+entirely on your Mac.
 
 This repository contains the complete pipeline: safe Messages database snapshotting, text
 extraction and pseudonymization, leakage-resistant dataset splits, tokenizer training, a custom
 decoder-only Transformer, MLX training, evaluation, memorization checks, model export, and a local
-terminal chat interface.
+terminal chat interface. The rewrite path adds isolated BART LoRA and Qwen QLoRA environments.
 
-Nothing is pretrained. The tokenizer and model both start from zero.
+The reply path and legacy tiny rewrite baseline start from zero. The recommended rewrite path uses
+a pinned pretrained BART base and keeps the private adapter separate and local.
 
 > [!IMPORTANT]
 > This builds a small personal style model, not a generally capable assistant. It can learn your
@@ -46,7 +48,8 @@ Read [the privacy documentation](docs/privacy.md) before running the data pipeli
 - URLs, email addresses, and phone-number-shaped strings are redacted by default.
 - Raw messages are never printed in normal logs.
 - Datasets, tokenizers, checkpoints, and final weights are excluded from Git.
-- No command uploads data or sends an iMessage. `chat` only prints a suggestion in the terminal.
+- Local training/inference never uploads data or sends an iMessage. The explicitly optional OpenAI
+  pair generator is the documented exception; `chat` and `rewrite-adapter` only print text.
 
 Pseudonymization is not anonymization. Keep `work/` and `outputs/` on a FileVault-protected Mac and
 never commit, upload, or share them.
@@ -60,7 +63,8 @@ never commit, upload, or share them.
 - [Homebrew](https://brew.sh/) or another way to install `uv`
 - Full Disk Access for Terminal, Codex, or whichever app runs the snapshot command
 
-The project uses Python 3.11 and pins MLX 0.32.0. It does not require PyTorch.
+The main project uses Python 3.11 and pins MLX 0.32.0. The recommended adapter workflow installs
+PyTorch/PEFT and MLX-LM only in ignored, isolated environments under `work/envs/`.
 
 ## Install
 
@@ -74,6 +78,15 @@ brew install uv
 uv sync
 uv run imessage-mlx doctor
 ```
+
+If this project lives under macOS `Documents` and `uv run` cannot import `imessage_mlx`, use:
+
+```bash
+export UV_NO_EDITABLE=1
+uv sync --no-editable
+```
+
+This avoids a macOS hidden-`.pth` issue. Re-run the sync after source changes.
 
 `doctor` verifies Apple Silicon, MLX Metal support, disk space, Git ignore coverage, private
 directory permissions, and read-only access to the Messages database.
@@ -256,17 +269,136 @@ message is the target:
 Never reverse these fields. `styled_text` is the text whose style the model learns. Pair files,
 splits, token arrays, tokenizers, and model artifacts stay under the ignored private directories.
 
-Pairs can be supplied manually or generated from recent outgoing messages with OpenAI. The optional
-generator sends redacted message text to OpenAI, so review its data policy before running it. Message
-content is never printed or written to the aggregate report. Put the credential in the ignored
-`.env` file:
+### Recommended local pretrained-adapter path
+
+The recommended rewrite model is a locally trained `facebook/bart-base` seq2seq LoRA adapter. The
+older 291K random-initialized Transformer remains available only as a rollback baseline. On the
+24 GB M4 balanced clean-split benchmark, BART used about 3.05 GB peak memory and processed about 6.7
+examples/second after sustained load. The matched 100-iteration Qwen3-0.6B QLoRA spike used about
+0.67 GB but produced repeated,
+malformed outputs, so BART won the content/style/fluency gate.
+
+Allow roughly 8 GB of free disk for isolated environments, model caches, adapters, and rollback
+artifacts. The measured full BART run is expected to take about 4–4.5 hours under sustained thermal
+load on the benchmarked machine. It uses deterministic decoding, stores adapters separately from
+the base model, and never uploads or fuses the adapter.
+
+The configs pin the exact downloaded model revisions. The `facebook/bart-base` Hugging Face model
+card does not declare a license; review the upstream model and fairseq terms before distributing
+anything. This project treats both base and adapter artifacts as local-only.
+
+Adapter preparation removes cross-split normalized/fuzzy duplicates, protected-fact conflicts, and
+messages over 512 characters. It reports the untouched signal strata, then caps exact and
+surface-only training examples to one quarter of the substantive stratum each. This prevents
+identity examples from dominating without inflating any unique-data report. The BART worker applies
+a final 256-token source/target check and reports every skipped outlier.
+
+The completed local run trained on 32,812 accepted pairs for about 4.1 hours and reached 0.922
+validation loss. On 1,589 held-out pairs it preserved protected facts in 99.18% of outputs, reached
+0.953 mean local semantic similarity, closed 85.4% of the measured style-marker gap and 55.4% of the
+target lexical-change gap, and produced no empty, repeated, or malformed outputs. These figures are
+specific to this private corpus; the review requirement still applies.
+
+### Multi-register convergence pilot
+
+The convergence pipeline teaches several English formulations of one meaning to map to the same
+user-written target. Stage A sends the accepted target to OpenAI for structured semantic extraction.
+Stage B is a separate request that receives only that semantic JSON and generates formal,
+everyday-neutral, verbose-indirect, and terse-conversational sources. Both requests use
+`store=False`; Stage B never receives the original wording.
+
+Run a small pilot before scaling. The example below selects 40 training targets, five validation
+targets, and five untouched test targets. Prompt/model/input fingerprints make interrupted runs
+resumable and prevent incompatible artifacts from being mixed.
+
+```bash
+uv run imessage-mlx generate-convergence-pilot \
+  --model gpt-5.6-luna \
+  --train-targets 40 \
+  --validation-targets 5 \
+  --test-targets 5 \
+  --output work/rewrite/convergence/pilot-50
+
+uv run imessage-mlx validate-convergence-data-semantics \
+  --environment work/envs/bart \
+  --pairs work/rewrite/convergence/pilot-50/published.jsonl \
+  --output work/rewrite/convergence/pilot-50/semantic-validated.jsonl
+
+uv run imessage-mlx prepare-convergence-adapters \
+  --pairs work/rewrite/convergence/pilot-50/semantic-validated.jsonl \
+  --output work/rewrite/convergence/adapters-50
+
+uv run imessage-mlx train-adapter \
+  --config configs/adapter-bart-base.yaml \
+  --environment work/envs/bart \
+  --data work/rewrite/convergence/adapters-50 \
+  --output outputs/adapters/bart-convergence-50
+```
+
+Preparation publishes only complete four-source target groups. It checks protected facts, local
+semantic similarity, sibling diversity, target lineage, and cross-split leakage. Evaluation runs the
+current and pilot adapters on the same challenge file, reports each register separately, measures
+copying and within-target convergence, and produces a private 50-group review. Pilot artifacts never
+replace the promoted adapter automatically.
+
+```bash
+uv run imessage-mlx prepare-adapters
+uv run imessage-mlx setup-adapter-environment bart --output work/envs/bart
+uv run imessage-mlx setup-adapter-environment qwen --output work/envs/mlx-lm
+
+uv run imessage-mlx train-adapter \
+  --config configs/adapter-bart-base.yaml \
+  --environment work/envs/bart \
+  --output outputs/adapters/bart-base-full
+
+uv run imessage-mlx predict-adapter \
+  --config configs/adapter-bart-base.yaml \
+  --environment work/envs/bart \
+  --adapter outputs/adapters/bart-base-full \
+  --output work/rewrite/evaluation/bart-full.jsonl
+
+uv run imessage-mlx evaluate-rewrite-semantics \
+  --predictions work/rewrite/evaluation/bart-full.jsonl \
+  --environment work/envs/bart \
+  --output work/rewrite/evaluation/bart-full-semantic.json
+
+uv run imessage-mlx evaluate-rewrite-adapter \
+  --predictions work/rewrite/evaluation/bart-full.jsonl \
+  --semantic-report work/rewrite/evaluation/bart-full-semantic.json \
+  --output work/rewrite/evaluation/bart-full-report.json
+
+uv run imessage-mlx predict-legacy-rewrite \
+  --test work/rewrite/adapters/bart/test.jsonl \
+  --output work/rewrite/evaluation/legacy-291k.jsonl
+
+uv run imessage-mlx review-rewrite-models \
+  --adapter work/rewrite/evaluation/bart-full.jsonl \
+  --legacy work/rewrite/evaluation/legacy-291k.jsonl
+
+uv run imessage-mlx promote-adapter \
+  --adapter outputs/adapters/bart-base-full \
+  --evaluation work/rewrite/evaluation/bart-full-report.json
+
+uv run imessage-mlx rewrite-adapter "I will be there at seven."
+```
+
+Promotion is blocked unless the held-out content, style, fluency, and memorization checks pass. A
+previous promoted artifact is moved to a timestamped rollback directory. Review every generated
+message and complete the private comparison checklist before replacing the baseline; no command
+sends messages automatically.
+
+Pairs can be supplied manually or generated from recent outgoing messages with OpenAI. The original
+neutral-pair generator sends redacted message text. The convergence generator sends the complete
+accepted `styled_text` to Stage A because that is the authorized source of meaning; Stage B sees only
+semantic JSON. Review the provider policy before running either command. Message content is never
+printed or written to aggregate reports. Put the credential in the ignored `.env` file:
 
 ```text
 OPENAI_API_KEY=your_key_here
 OPENAI_MODEL=gpt-5.5
 ```
 
-Start with a resumable 500-message pilot:
+The following from-scratch workflow is retained for baseline comparison:
 
 ```bash
 uv run imessage-mlx generate-rewrite-pairs --limit 500
@@ -281,7 +413,7 @@ uv run imessage-mlx train-tokenizer \
 uv run imessage-mlx rewrite-corpus-stats
 
 uv run imessage-mlx train \
-  --config configs/model-rewrite-190k.yaml \
+  --config configs/model-rewrite-290k.yaml \
   --data work/rewrite/tokens \
   --tokenizer outputs/rewrite-tokenizer \
   --output outputs/runs/rewrite-model \
@@ -300,9 +432,9 @@ uv run imessage-mlx rewrite \
 
 Rewrite training applies loss only to `styled_text`, not to the neutral prompt or padding. The
 rewrite selector examines the training split only and requires at least 10,000 unique pairs, 100,000
-supervised target tokens, and two target tokens per model parameter. It selects the largest eligible
-rewrite preset with no unsafe fallback. For the current corpus, `model-rewrite-190k` is the expected
-choice; `model-rewrite-290k` is selected only if its measured ratio reaches two.
+supervised target tokens, and 1.5 target tokens per model parameter. It selects the largest eligible
+rewrite preset with no unsafe fallback. The 1.5 ratio is intentionally experimental and more
+memorization-prone than the reply model's safety policy.
 
 These task-specific thresholds are still heuristics, not a quality guarantee. This tiny model may
 change meaning or memorize private text, so review every result before sending it. The standard
@@ -327,7 +459,8 @@ It does not reliably learn:
 
 Making the architecture larger without adding more unique training text usually increases
 memorization rather than intelligence. If you want general reasoning plus personal style, fine-tune
-a pretrained model instead; this repository intentionally demonstrates true from-scratch training.
+a pretrained model. The reply path retains the from-scratch implementation for study, while the
+recommended rewrite path now uses a local pretrained LoRA adapter for semantic reliability.
 
 ## Included model presets
 
