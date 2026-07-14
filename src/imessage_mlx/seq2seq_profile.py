@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-
 SEQ2SEQ_ARCHITECTURES = frozenset({"bart", "flan_t5", "marian"})
 
 

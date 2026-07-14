@@ -301,8 +301,7 @@ def generate_convergence_pilot_command(
     )
     _emit(generation_report)
     if generation_report["variants"]["incomplete_active_groups"] or (
-        generation_report["selection"]["active"]
-        != generation_report["selection"]["requested"]
+        generation_report["selection"]["active"] != generation_report["selection"]["requested"]
     ):
         raise typer.Exit(code=1)
 
@@ -639,12 +638,8 @@ def compare_seq2seq_evaluations_command(
     flan_training: Annotated[Path | None, typer.Option(help="Flan-T5 training report")] = None,
     opus_training: Annotated[Path | None, typer.Option(help="OPUS-MT training report")] = None,
     bart_prediction_log: Annotated[Path | None, typer.Option(help="BART prediction log")] = None,
-    flan_prediction_log: Annotated[
-        Path | None, typer.Option(help="Flan-T5 prediction log")
-    ] = None,
-    opus_prediction_log: Annotated[
-        Path | None, typer.Option(help="OPUS-MT prediction log")
-    ] = None,
+    flan_prediction_log: Annotated[Path | None, typer.Option(help="Flan-T5 prediction log")] = None,
+    opus_prediction_log: Annotated[Path | None, typer.Option(help="OPUS-MT prediction log")] = None,
 ) -> None:
     """Select among BART, Flan-T5, and OPUS-MT using the same held-out gates."""
     reports = {

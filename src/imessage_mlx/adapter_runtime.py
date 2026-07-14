@@ -25,6 +25,7 @@ BART_PACKAGES = (
     "peft==0.19.1",
     "sentence-transformers==5.6.0",
     "sentencepiece==0.2.2",
+    "sacremoses==0.1.1",
 )
 QWEN_PACKAGES = ("mlx-lm[train]==0.31.3",)
 ADAPTER_ARCHITECTURES = SEQ2SEQ_ARCHITECTURES | {"qwen"}
@@ -278,9 +279,7 @@ def predict_adapter(
         data = data / "benchmark"
     family = "bart" if architecture in SEQ2SEQ_ARCHITECTURES else "mlx"
     prediction_data = (
-        Path(data_file).resolve()
-        if data_file is not None
-        else data / family / "test.jsonl"
+        Path(data_file).resolve() if data_file is not None else data / family / "test.jsonl"
     )
     command = [
         str(python),
@@ -563,9 +562,7 @@ def promote_adapter(
                 "base_model_license",
                 adapter_config.get(
                     "base_model_license",
-                    "not_declared_in_hugging_face_model_card"
-                    if architecture == "bart"
-                    else None,
+                    "not_declared_in_hugging_face_model_card" if architecture == "bart" else None,
                 ),
             ),
             "deterministic_generation": generation,

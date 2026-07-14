@@ -5,7 +5,6 @@ import pytest
 from imessage_mlx.config import load_yaml
 from imessage_mlx.seq2seq_profile import format_seq2seq_source, resolve_seq2seq_profile
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
