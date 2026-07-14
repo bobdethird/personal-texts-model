@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from imessage_mlx.data import pair_generation
 from imessage_mlx.data.pair_generation import (
+    NEUTRALIZATION_INSTRUCTIONS,
     NeutralizedBatch,
     NeutralizedItem,
     create_rewrite_review,
@@ -14,6 +15,12 @@ from imessage_mlx.data.pair_generation import (
     select_outgoing_messages,
 )
 from imessage_mlx.utils import read_jsonl, write_jsonl
+
+
+def test_neutralization_prompt_has_corpus_specific_abbreviations() -> None:
+    assert '"sm" means "something"' in NEUTRALIZATION_INSTRUCTIONS
+    assert '"ts" means either' in NEUTRALIZATION_INSTRUCTIONS
+    assert 'preserve "ts" rather than guessing' in NEUTRALIZATION_INSTRUCTIONS
 
 
 def _messages(path: Path) -> None:

@@ -19,6 +19,9 @@ Extract only the meaning of this text message as one JSON object with these keys
 intent, propositions, entities, times, numbers, placeholders, negated, uncertainty,
 emotion, intensity. Preserve every fact, entity, time, number, negation, modality,
 question intent, emotional meaning, and intensity. Do not quote or imitate the wording.
+Apply these corpus-specific, case-insensitive meanings: "sm" means "something"; "ts"
+means either "this" or "type shit". Resolve "ts" only when context makes one reading
+clear; otherwise record the ambiguity instead of guessing.
 
 Message:
 """.strip()

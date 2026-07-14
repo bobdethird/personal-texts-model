@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from imessage_mlx.data.repair import repair_low_signal_pairs
+from imessage_mlx.data.repair import SEMANTIC_EXTRACTION_INSTRUCTION, repair_low_signal_pairs
 from imessage_mlx.utils import read_jsonl, write_jsonl
 
 
@@ -12,6 +12,12 @@ def _pair(pair_id: str, neutral: str, styled: str) -> dict[str, object]:
         "neutral_text": neutral,
         "styled_text": styled,
     }
+
+
+def test_repair_prompt_has_corpus_specific_abbreviations() -> None:
+    assert '"sm" means "something"' in SEMANTIC_EXTRACTION_INSTRUCTION
+    assert '"ts"' in SEMANTIC_EXTRACTION_INSTRUCTION
+    assert '"type shit"' in SEMANTIC_EXTRACTION_INSTRUCTION
 
 
 def test_targeted_repair_blinds_reconstruction_and_keeps_failed_original(

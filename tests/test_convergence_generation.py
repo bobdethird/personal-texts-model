@@ -27,6 +27,14 @@ from imessage_mlx.utils import read_jsonl, write_jsonl
 STYLED_TARGET = "ZXQUNIQUEORIGINALPHRASE asks us to discuss the plan"
 
 
+def test_semantic_prompt_has_corpus_specific_abbreviations() -> None:
+    instructions = convergence_generation.SEMANTIC_EXTRACTION_INSTRUCTIONS
+
+    assert '"sm" means "something"' in instructions
+    assert '"ts" can mean either "this" or "type shit"' in instructions
+    assert "set eligible=false rather than guessing" in instructions
+
+
 def _bart_record(index: int, *, target: str | None = None) -> dict[str, str]:
     return {
         "pair_id": f"pair-{index}",

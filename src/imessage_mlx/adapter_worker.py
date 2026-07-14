@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from imessage_mlx.config import load_yaml
-from imessage_mlx.utils import ensure_private_dir, read_jsonl, write_json, write_jsonl
+from imessage_mlx.progress import ProgressBar
+from imessage_mlx.utils import ensure_private_dir, read_jsonl, sha256_file, write_json, write_jsonl
 
 
 def _chmod_private_tree(root: Path) -> None:
@@ -40,9 +41,10 @@ def train_bart(
     config_path: str | Path,
     data_dir: str | Path,
     output_dir: str | Path,
+    initial_adapter_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     import torch
-    from peft import LoraConfig, TaskType, get_peft_model
+    from peft import LoraConfig, PeftModel, TaskType, get_peft_model
     from torch.utils.data import DataLoader, Dataset
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, DataCollatorForSeq2Seq
 
@@ -82,17 +84,31 @@ def train_bart(
     if not train_rows or not valid_rows:
         raise ValueError("BART length filtering removed every train or validation example")
     model = AutoModelForSeq2SeqLM.from_pretrained(base_model, revision=revision)
-    model = get_peft_model(
-        model,
-        LoraConfig(
-            task_type=TaskType.SEQ_2_SEQ_LM,
-            inference_mode=False,
-            r=int(config.get("lora_rank", 8)),
-            lora_alpha=int(config.get("lora_alpha", 16)),
-            lora_dropout=float(config.get("lora_dropout", 0.1)),
-            target_modules=["q_proj", "v_proj"],
-        ),
-    )
+    initial_adapter_path = Path(initial_adapter_dir).resolve() if initial_adapter_dir else None
+    initial_adapter_hash = None
+    if initial_adapter_path is not None:
+        adapter_path = (
+            initial_adapter_path / "adapter"
+            if (initial_adapter_path / "adapter").is_dir()
+            else initial_adapter_path
+        )
+        adapter_weights = adapter_path / "adapter_model.safetensors"
+        if not adapter_weights.exists():
+            raise FileNotFoundError(f"Initial BART adapter weights are missing: {adapter_weights}")
+        initial_adapter_hash = sha256_file(adapter_weights)
+        model = PeftModel.from_pretrained(model, adapter_path, is_trainable=True)
+    else:
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                task_type=TaskType.SEQ_2_SEQ_LM,
+                inference_mode=False,
+                r=int(config.get("lora_rank", 8)),
+                lora_alpha=int(config.get("lora_alpha", 16)),
+                lora_dropout=float(config.get("lora_dropout", 0.1)),
+                target_modules=["q_proj", "v_proj"],
+            ),
+        )
     model.to(device)
 
     class PairDataset(Dataset):
@@ -157,25 +173,40 @@ def train_bart(
     for epoch in range(epochs):
         model.train()
         train_loss = 0.0
-        for batch_index, batch in enumerate(train_loader):
-            batch = {key: value.to(device) for key, value in batch.items()}
-            loss = model(**batch).loss / accumulation
-            loss.backward()
-            train_loss += float(loss.item()) * accumulation
-            if (batch_index + 1) % accumulation == 0 or batch_index + 1 == len(train_loader):
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                updates += 1
+        train_progress = ProgressBar(f"Epoch {epoch + 1}/{epochs} train", len(train_loader))
+        try:
+            for batch_index, batch in enumerate(train_loader):
+                batch = {key: value.to(device) for key, value in batch.items()}
+                loss = model(**batch).loss / accumulation
+                loss.backward()
+                train_loss += float(loss.item()) * accumulation
+                if (batch_index + 1) % accumulation == 0 or batch_index + 1 == len(
+                    train_loader
+                ):
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    updates += 1
+                train_progress.advance()
+        finally:
+            train_progress.close()
 
         model.eval()
         validation_loss = 0.0
         validation_batches = 0
+        validation_progress = ProgressBar(
+            f"Epoch {epoch + 1}/{epochs} valid",
+            len(valid_loader),
+        )
         with torch.no_grad():
-            for batch in valid_loader:
-                batch = {key: value.to(device) for key, value in batch.items()}
-                validation_loss += float(model(**batch).loss.item())
-                validation_batches += 1
+            try:
+                for batch in valid_loader:
+                    batch = {key: value.to(device) for key, value in batch.items()}
+                    validation_loss += float(model(**batch).loss.item())
+                    validation_batches += 1
+                    validation_progress.advance()
+            finally:
+                validation_progress.close()
         validation_loss /= max(1, validation_batches)
         history.append(
             {
@@ -202,6 +233,8 @@ def train_bart(
         "architecture": "bart",
         "base_model": base_model,
         "base_revision": revision,
+        "continued_from_adapter": initial_adapter_path is not None,
+        "initial_adapter_hash": initial_adapter_hash,
         "train_examples": len(train_rows),
         "validation_examples": len(valid_rows),
         "skipped_oversized_train_examples": original_train_count - len(train_rows),
@@ -590,6 +623,7 @@ def main() -> None:
         subparser.add_argument("--config", required=True)
         if command == "train-bart":
             subparser.add_argument("--data", required=True)
+            subparser.add_argument("--initial-adapter")
         else:
             subparser.add_argument("--data", required=True)
             subparser.add_argument("--adapter", required=True)
@@ -618,7 +652,12 @@ def main() -> None:
             limit=arguments.limit,
         )
     elif arguments.command == "train-bart":
-        report = train_bart(arguments.config, arguments.data, arguments.output)
+        report = train_bart(
+            arguments.config,
+            arguments.data,
+            arguments.output,
+            initial_adapter_dir=arguments.initial_adapter,
+        )
     elif arguments.command == "predict-bart":
         report = predict_bart(arguments.config, arguments.data, arguments.adapter, arguments.output)
     else:

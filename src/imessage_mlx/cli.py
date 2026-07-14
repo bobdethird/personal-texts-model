@@ -297,6 +297,7 @@ def generate_convergence_pilot_command(
             max_characters=max_characters,
             concurrency=concurrency,
             max_variant_attempts=max_variant_attempts,
+            show_progress=True,
         )
     )
     _emit(generation_report)
@@ -392,6 +393,10 @@ def train_adapter_command(
     benchmark: Annotated[
         bool, typer.Option(help="Use the small architecture benchmark split")
     ] = False,
+    initial_adapter: Annotated[
+        Path | None,
+        typer.Option(help="Optional BART adapter run to continue training"),
+    ] = None,
 ) -> None:
     """Train a local BART LoRA or Qwen QLoRA adapter."""
     _emit(
@@ -401,6 +406,7 @@ def train_adapter_command(
             resolve_path(output),
             resolve_path(environment),
             benchmark=benchmark,
+            initial_adapter_dir=resolve_path(initial_adapter) if initial_adapter else None,
             project_root=Path.cwd(),
         )
     )

@@ -22,6 +22,7 @@ from imessage_mlx.data.adapters import (
     protected_facts,
 )
 from imessage_mlx.data.rewrite import STRUCTURAL_TOKEN_RE
+from imessage_mlx.progress import ProgressBar
 from imessage_mlx.utils import (
     ensure_private_dir,
     read_jsonl,
@@ -34,7 +35,7 @@ from imessage_mlx.utils import (
 CONVERGENCE_SCHEMA_VERSION = 1
 SEMANTIC_OUTPUT_SCHEMA_VERSION = "convergence-semantics-v1"
 VARIANT_OUTPUT_SCHEMA_VERSION = "convergence-variants-v1"
-SEMANTIC_PROMPT_VERSION = "semantic-extraction-v5"
+SEMANTIC_PROMPT_VERSION = "semantic-extraction-v6"
 VARIANT_PROMPT_VERSION = "blind-style-generation-v4"
 
 STYLE_KINDS = (
@@ -54,10 +55,14 @@ numbers, negation, modality or uncertainty, question intent, emotion, and intens
 
 Preserve unresolved pronouns and references without resolving them. Canonicalize common, unambiguous
 English texting abbreviations and slang such as "rn", "omw", "tryna", "prolly", "lol", "mb", and
-"aight"; record their ordinary meaning rather than their wording. Preserve grammatical perspective:
-use I/me/my for the author, you/your for the addressee, we/our for the author plus others, and retain
-third-person pronouns, tense, modality, and ellipsis. Do not replace people with labels such as
-"speaker", "sender", "addressee", "recipient", "entity", or "unspecified actor" in propositions.
+"aight"; record their ordinary meaning rather than their wording. Apply these corpus-specific,
+case-insensitive meanings: "sm" means "something"; "ts" can mean either "this" or "type shit".
+Resolve "ts" only when surrounding grammar and context make one reading clear. If they do not,
+set eligible=false rather than guessing or silently choosing a meaning. Preserve grammatical
+perspective: use I/me/my for the author, you/your for the addressee, we/our for the author plus
+others, and retain third-person pronouns, tense, modality, and ellipsis. Do not replace people with
+labels such as "speaker", "sender", "addressee", "recipient", "entity", or "unspecified actor" in
+propositions.
 
 Put genuinely ambiguous coined terms, codes, product labels, and names into protected_literals exactly
 as written. Never expand or guess their meaning. A protected literal is valid only when the surrounding
@@ -88,6 +93,8 @@ Return exactly one source for each of these labels:
 - terse_conversational: a concise standard-English formulation that retains every proposition
 
 Make the sources substantively different in wording and register, not punctuation-only variants.
+Use the canonical standard-English meaning from the semantic JSON; do not reintroduce source
+abbreviations that were expanded during semantic extraction.
 Copy every protected_literal exactly as supplied in every source. Do not expand, translate, quote,
 define, normalize, or reinterpret protected literals. Verbose and formal variants may add connective
 wording but must not add politeness, urgency, certainty, timing, or other meaning. Terse variants must
@@ -922,6 +929,7 @@ async def generate_openai_convergence_data(
     concurrency: int = 4,
     max_variant_attempts: int = 2,
     semantic_validator: SemanticValidator | None = None,
+    show_progress: bool = False,
 ) -> dict[str, Any]:
     if not api_key:
         raise ValueError("OPENAI_API_KEY is required")
@@ -991,9 +999,11 @@ async def generate_openai_convergence_data(
             )
 
     attempted_semantics: set[str] = set()
+    semantic_wave_number = 0
+    variant_wave_number = 0
 
     async def run_semantic_wave(targets: list[dict[str, Any]]) -> None:
-        nonlocal generated_semantics
+        nonlocal generated_semantics, semantic_wave_number
         pending = [
             target
             for target in targets
@@ -1003,10 +1013,26 @@ async def generate_openai_convergence_data(
         if not pending:
             return
         attempted_semantics.update(str(target["target_id"]) for target in pending)
-        results = await asyncio.gather(
-            *(request_semantic(target) for target in pending),
-            return_exceptions=True,
+        semantic_wave_number += 1
+        progress = ProgressBar(
+            f"Stage A semantics wave {semantic_wave_number}",
+            len(pending),
+            enabled=show_progress,
         )
+
+        async def tracked_request(target: dict[str, Any]):
+            try:
+                return await request_semantic(target)
+            finally:
+                progress.advance()
+
+        try:
+            results = await asyncio.gather(
+                *(tracked_request(target) for target in pending),
+                return_exceptions=True,
+            )
+        finally:
+            progress.close()
         semantic_records: list[dict[str, Any]] = []
         usage_records: list[dict[str, Any]] = []
         for target, result in zip(pending, results, strict=True):
@@ -1043,7 +1069,7 @@ async def generate_openai_convergence_data(
         _append_private_jsonl(usage_path, usage_records)
 
     async def run_variant_attempts(targets: list[dict[str, Any]]) -> None:
-        nonlocal generated_variant_attempts, accepted_variants
+        nonlocal generated_variant_attempts, accepted_variants, variant_wave_number
         for _round in range(max_variant_attempts):
             pending_targets = [
                 target
@@ -1055,16 +1081,32 @@ async def generate_openai_convergence_data(
             ]
             if not pending_targets:
                 break
-            results = await asyncio.gather(
-                *(
-                    request_variants(
+            variant_wave_number += 1
+            progress = ProgressBar(
+                f"Stage B variants wave {variant_wave_number}",
+                len(pending_targets),
+                enabled=show_progress,
+            )
+
+            async def tracked_request(
+                target: dict[str, Any],
+                _progress: ProgressBar = progress,
+            ):
+                try:
+                    return await request_variants(
                         target,
                         semantics[str(target["target_id"])],
                     )
-                    for target in pending_targets
-                ),
-                return_exceptions=True,
-            )
+                finally:
+                    _progress.advance()
+
+            try:
+                results = await asyncio.gather(
+                    *(tracked_request(target) for target in pending_targets),
+                    return_exceptions=True,
+                )
+            finally:
+                progress.close()
             variant_records: list[dict[str, Any]] = []
             usage_records: list[dict[str, Any]] = []
             for target, result in zip(pending_targets, results, strict=True):

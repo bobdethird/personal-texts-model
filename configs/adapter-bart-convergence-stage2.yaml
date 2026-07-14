@@ -1,0 +1,17 @@
+name: bart-base-lora-convergence-stage2
+architecture: bart
+base_model: facebook/bart-base
+revision: aadd2ab0ae0c8268c7c9693540e9904811f36177
+max_length: 256
+max_new_tokens: 64
+batch_size: 2
+gradient_accumulation_steps: 8
+epochs: 3
+learning_rate: 0.00005
+weight_decay: 0.01
+warmup_fraction: 0.05
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.1
+early_stopping_patience: 2
+seed: 42

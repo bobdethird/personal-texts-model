@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import UTC, datetime
@@ -33,6 +34,7 @@ def _run(
     *,
     cwd: Path,
     log_path: Path | None = None,
+    stream_output: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment.update(
@@ -42,21 +44,60 @@ def _run(
             "DO_NOT_TRACK": "1",
             "WANDB_DISABLED": "true",
             "PYTHONPATH": str(cwd / "src"),
+            "PYTHONUNBUFFERED": "1",
         }
     )
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if log_path is not None:
-        atomic_write_text(
-            log_path,
-            completed.stdout + ("\n" if completed.stdout else "") + completed.stderr,
+    if stream_output:
+        log_handle = None
+        try:
+            if log_path is not None:
+                ensure_private_dir(log_path.parent)
+                log_path.touch(mode=0o600, exist_ok=True)
+                log_path.chmod(0o600)
+                log_handle = log_path.open("w", encoding="utf-8")
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            output_chunks: list[str] = []
+            if process.stdout is None:
+                raise RuntimeError("Adapter subprocess did not expose its output stream")
+            for chunk in process.stdout:
+                output_chunks.append(chunk)
+                sys.stderr.write(chunk)
+                sys.stderr.flush()
+                if log_handle is not None:
+                    log_handle.write(chunk)
+                    log_handle.flush()
+            return_code = process.wait()
+            completed = subprocess.CompletedProcess(
+                command,
+                return_code,
+                "".join(output_chunks),
+                "",
+            )
+        finally:
+            if log_handle is not None:
+                log_handle.close()
+    else:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
         )
+        if log_path is not None:
+            atomic_write_text(
+                log_path,
+                completed.stdout + ("\n" if completed.stdout else "") + completed.stderr,
+            )
     if completed.returncode:
         raise RuntimeError(
             f"Adapter command failed with exit code {completed.returncode}; "
@@ -149,6 +190,7 @@ def train_adapter(
     environment_dir: str | Path,
     *,
     benchmark: bool = False,
+    initial_adapter_dir: str | Path | None = None,
     project_root: str | Path | None = None,
 ) -> dict[str, Any]:
     root = Path(project_root or Path.cwd()).resolve()
@@ -157,6 +199,8 @@ def train_adapter(
     architecture = str(config.get("architecture"))
     if architecture not in {"bart", "qwen"}:
         raise ValueError("Adapter config architecture must be 'bart' or 'qwen'")
+    if initial_adapter_dir is not None and architecture != "bart":
+        raise ValueError("Adapter continuation is currently supported only for BART")
     python = Path(environment_dir).resolve() / "bin/python"
     if not python.exists():
         raise FileNotFoundError(f"Adapter environment is missing {python}")
@@ -179,6 +223,8 @@ def train_adapter(
             "--output",
             str(output),
         ]
+        if initial_adapter_dir is not None:
+            command.extend(["--initial-adapter", str(Path(initial_adapter_dir).resolve())])
     else:
         adapter_path = ensure_private_dir(output / "adapter")
         iterations = int(config.get("iterations", 1200))
@@ -217,7 +263,12 @@ def train_adapter(
             "-1",
             "--mask-prompt",
         ]
-    completed = _run(command, cwd=root, log_path=output / "training.log")
+    completed = _run(
+        command,
+        cwd=root,
+        log_path=output / "training.log",
+        stream_output=True,
+    )
     elapsed = time.perf_counter() - started
     report_path = output / "training-report.json"
     if report_path.exists():

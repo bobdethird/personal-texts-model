@@ -1,9 +1,11 @@
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from imessage_mlx.adapter_runtime import (
+    _run,
     environment_python,
     promote_adapter,
     rewrite_with_adapter,
@@ -15,6 +17,26 @@ from imessage_mlx.utils import write_json
 
 def test_environment_python_is_isolated() -> None:
     assert environment_python("work/envs/bart") == Path("work/envs/bart/bin/python")
+
+
+def test_streaming_adapter_command_tees_private_log(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    log_path = tmp_path / "training.log"
+
+    completed = _run(
+        [sys.executable, "-c", "print('progress 50%')"],
+        cwd=tmp_path,
+        log_path=log_path,
+        stream_output=True,
+    )
+
+    assert completed.returncode == 0
+    assert "progress 50%" in completed.stdout
+    assert "progress 50%" in capsys.readouterr().err
+    assert log_path.read_text(encoding="utf-8") == "progress 50%\n"
+    assert log_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_setup_rejects_unknown_architecture(tmp_path: Path) -> None:
@@ -120,3 +142,43 @@ def test_qwen_training_masks_prompt_in_isolated_environment(
 
     assert "--mask-prompt" in captured[-1]
     assert captured[-1][captured[-1].index("--data") + 1].endswith("/data/mlx")
+
+
+def test_bart_training_can_continue_existing_adapter(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = tmp_path / "bart.yaml"
+    config.write_text(
+        "\n".join(
+            (
+                "architecture: bart",
+                "base_model: facebook/bart-base",
+                "revision: pinned",
+            )
+        )
+    )
+    python = tmp_path / "env/bin/python"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    initial = tmp_path / "initial"
+    initial.mkdir()
+    captured: list[list[str]] = []
+
+    def fake_run(command, **_options):
+        captured.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("imessage_mlx.adapter_runtime._run", fake_run)
+
+    train_adapter(
+        config,
+        tmp_path / "data",
+        tmp_path / "run",
+        tmp_path / "env",
+        initial_adapter_dir=initial,
+        project_root=tmp_path,
+    )
+
+    command = captured[-1]
+    assert command[command.index("--initial-adapter") + 1] == str(initial.resolve())

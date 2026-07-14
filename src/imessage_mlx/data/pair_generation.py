@@ -25,6 +25,9 @@ Rules:
 - Preserve ordinary casual vocabulary and contractions such as "I'm", "don't", and "that's".
 - Remove only distinctly personal slang, unclear abbreviations, stylized casing, and idiosyncratic
   punctuation.
+- Apply these corpus-specific, case-insensitive meanings: "sm" means "something"; "ts" means either
+  "this" or "type shit". Expand "ts" only when surrounding grammar and context clearly determine
+  which meaning applies; otherwise preserve "ts" rather than guessing.
 - Do not replace simple words with more formal synonyms or add politeness that was not present.
 - Keep profanity, humor, emotional intensity, and directness when they affect meaning.
 - Make the smallest wording change needed to produce a clear, casually conversational draft.
