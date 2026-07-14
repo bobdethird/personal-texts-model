@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from imessage_mlx.config import load_yaml
+from imessage_mlx.seq2seq_profile import SEQ2SEQ_ARCHITECTURES
 from imessage_mlx.utils import (
     atomic_write_text,
     ensure_private_dir,
@@ -26,6 +27,7 @@ BART_PACKAGES = (
     "sentencepiece==0.2.2",
 )
 QWEN_PACKAGES = ("mlx-lm[train]==0.31.3",)
+ADAPTER_ARCHITECTURES = SEQ2SEQ_ARCHITECTURES | {"qwen"}
 
 
 def _run(
@@ -101,8 +103,10 @@ def setup_adapter_environment(
     *,
     project_root: str | Path | None = None,
 ) -> dict[str, Any]:
-    if architecture not in {"bart", "qwen"}:
-        raise ValueError("Adapter architecture must be 'bart' or 'qwen'")
+    if architecture not in ADAPTER_ARCHITECTURES:
+        raise ValueError(
+            "Adapter architecture must be one of: " + ", ".join(sorted(ADAPTER_ARCHITECTURES))
+        )
     root = Path(project_root or Path.cwd()).resolve()
     destination = Path(environment_dir).resolve()
     ensure_private_dir(destination.parent)
@@ -117,7 +121,7 @@ def setup_adapter_environment(
         ],
         cwd=root,
     )
-    packages = BART_PACKAGES if architecture == "bart" else QWEN_PACKAGES
+    packages = BART_PACKAGES if architecture in SEQ2SEQ_ARCHITECTURES else QWEN_PACKAGES
     _run(
         [
             "uv",
@@ -155,8 +159,11 @@ def train_adapter(
     config_file = Path(config_path).resolve()
     config = load_yaml(config_file)
     architecture = str(config.get("architecture"))
-    if architecture not in {"bart", "qwen"}:
-        raise ValueError("Adapter config architecture must be 'bart' or 'qwen'")
+    if architecture not in ADAPTER_ARCHITECTURES:
+        raise ValueError(
+            "Adapter config architecture must be one of: "
+            + ", ".join(sorted(ADAPTER_ARCHITECTURES))
+        )
     python = Path(environment_dir).resolve() / "bin/python"
     if not python.exists():
         raise FileNotFoundError(f"Adapter environment is missing {python}")
@@ -166,12 +173,12 @@ def train_adapter(
         data = data / "benchmark"
     started = time.perf_counter()
 
-    if architecture == "bart":
+    if architecture in SEQ2SEQ_ARCHITECTURES:
         command = [
             str(python),
             "-m",
             "imessage_mlx.adapter_worker",
-            "train-bart",
+            "train-bart" if architecture == "bart" else "train-seq2seq",
             "--config",
             str(config_file),
             "--data",
@@ -228,6 +235,9 @@ def train_adapter(
             "architecture": architecture,
             "base_model": str(config["base_model"]),
             "base_revision": str(config["revision"]),
+            "base_model_license": config.get("base_model_license"),
+            "source_prefix": config.get("source_prefix", ""),
+            "lora_target_modules": config.get("lora_target_modules"),
             "elapsed_seconds": elapsed,
             "benchmark": benchmark,
             "private_local_artifact": True,
@@ -255,15 +265,18 @@ def predict_adapter(
     config_file = Path(config_path).resolve()
     config = load_yaml(config_file)
     architecture = str(config.get("architecture"))
-    if architecture not in {"bart", "qwen"}:
-        raise ValueError("Adapter config architecture must be 'bart' or 'qwen'")
+    if architecture not in ADAPTER_ARCHITECTURES:
+        raise ValueError(
+            "Adapter config architecture must be one of: "
+            + ", ".join(sorted(ADAPTER_ARCHITECTURES))
+        )
     python = Path(environment_dir).resolve() / "bin/python"
     if not python.exists():
         raise FileNotFoundError(f"Adapter environment is missing {python}")
     data = Path(data_root).resolve()
     if benchmark:
         data = data / "benchmark"
-    family = "bart" if architecture == "bart" else "mlx"
+    family = "bart" if architecture in SEQ2SEQ_ARCHITECTURES else "mlx"
     prediction_data = (
         Path(data_file).resolve()
         if data_file is not None
@@ -273,7 +286,13 @@ def predict_adapter(
         str(python),
         "-m",
         "imessage_mlx.adapter_worker",
-        f"predict-{architecture}",
+        (
+            "predict-bart"
+            if architecture == "bart"
+            else "predict-seq2seq"
+            if architecture in SEQ2SEQ_ARCHITECTURES
+            else "predict-qwen"
+        ),
         "--config",
         str(config_file),
         "--data",
@@ -405,8 +424,11 @@ def rewrite_with_adapter(
     config_file = Path(config_path).resolve()
     config = load_yaml(config_file)
     architecture = str(config.get("architecture"))
-    if architecture not in {"bart", "qwen"}:
-        raise ValueError("Adapter config architecture must be 'bart' or 'qwen'")
+    if architecture not in ADAPTER_ARCHITECTURES:
+        raise ValueError(
+            "Adapter config architecture must be one of: "
+            + ", ".join(sorted(ADAPTER_ARCHITECTURES))
+        )
     run = Path(adapter_dir).resolve()
     manifest_path = run / "data-manifest.json"
     if manifest_path.exists():
@@ -420,7 +442,13 @@ def rewrite_with_adapter(
             str(python),
             "-m",
             "imessage_mlx.adapter_worker",
-            f"rewrite-{architecture}",
+            (
+                "rewrite-bart"
+                if architecture == "bart"
+                else "rewrite-seq2seq"
+                if architecture in SEQ2SEQ_ARCHITECTURES
+                else "rewrite-qwen"
+            ),
             "--config",
             str(config_file),
             "--adapter",
@@ -511,6 +539,14 @@ def promote_adapter(
                 "base_revision",
                 adapter_config.get("revision"),
             ),
+            "source_prefix": training_report.get(
+                "source_prefix",
+                adapter_config.get("source_prefix", ""),
+            ),
+            "lora_target_modules": training_report.get(
+                "lora_target_modules",
+                adapter_config.get("lora_target_modules"),
+            ),
             "training_seed": adapter_config.get("seed"),
             "adapter_config_sha256": (
                 sha256_file(config_path) if config_path is not None else None
@@ -523,8 +559,14 @@ def promote_adapter(
                 if architecture_report_path is not None
                 else None
             ),
-            "base_model_license": (
-                "not_declared_in_hugging_face_model_card" if architecture == "bart" else None
+            "base_model_license": training_report.get(
+                "base_model_license",
+                adapter_config.get(
+                    "base_model_license",
+                    "not_declared_in_hugging_face_model_card"
+                    if architecture == "bart"
+                    else None,
+                ),
             ),
             "deterministic_generation": generation,
             "no_automatic_sending": True,

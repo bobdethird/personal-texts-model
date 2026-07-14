@@ -242,7 +242,7 @@ def prepare_adapters_command(
     benchmark_eval_size: Annotated[int, typer.Option(min=1)] = 200,
     max_characters: Annotated[int, typer.Option(min=1)] = 512,
 ) -> None:
-    """Build leakage-clean BART and MLX-LM adapter datasets."""
+    """Build leakage-clean seq2seq and MLX-LM adapter datasets."""
     _emit(
         prepare_adapter_datasets(
             resolve_path(splits),
@@ -366,7 +366,10 @@ def prepare_convergence_adapters_command(
 
 @app.command("setup-adapter-environment")
 def setup_adapter_environment_command(
-    architecture: Annotated[str, typer.Argument(help="Adapter architecture: bart or qwen")],
+    architecture: Annotated[
+        str,
+        typer.Argument(help="Adapter architecture: bart, flan_t5, marian, or qwen"),
+    ],
     output: Annotated[Path, typer.Option(help="Private isolated virtual environment")],
 ) -> None:
     """Install an isolated local adapter-training environment."""
@@ -393,7 +396,7 @@ def train_adapter_command(
         bool, typer.Option(help="Use the small architecture benchmark split")
     ] = False,
 ) -> None:
-    """Train a local BART LoRA or Qwen QLoRA adapter."""
+    """Train a local seq2seq LoRA or Qwen QLoRA adapter."""
     _emit(
         train_adapter(
             resolve_path(config),
@@ -421,7 +424,7 @@ def predict_adapter_command(
         bool, typer.Option(help="Use the small architecture benchmark split")
     ] = False,
     test_file: Annotated[
-        Path | None, typer.Option(help="Optional explicit BART or MLX test JSONL")
+        Path | None, typer.Option(help="Optional explicit seq2seq or MLX test JSONL")
     ] = None,
 ) -> None:
     """Generate held-out predictions from a local adapter."""
@@ -624,6 +627,59 @@ def compare_rewrite_evaluations_command(
     )
 
 
+@app.command("compare-seq2seq-evaluations")
+def compare_seq2seq_evaluations_command(
+    bart: Annotated[Path, typer.Option(help="BART evaluation report")],
+    flan: Annotated[Path, typer.Option(help="Flan-T5 evaluation report")],
+    opus: Annotated[Path, typer.Option(help="OPUS-MT evaluation report")],
+    output: Annotated[Path, typer.Option(help="Private model decision report")] = Path(
+        "work/rewrite/evaluation/seq2seq-selection.json"
+    ),
+    bart_training: Annotated[Path | None, typer.Option(help="BART training report")] = None,
+    flan_training: Annotated[Path | None, typer.Option(help="Flan-T5 training report")] = None,
+    opus_training: Annotated[Path | None, typer.Option(help="OPUS-MT training report")] = None,
+    bart_prediction_log: Annotated[Path | None, typer.Option(help="BART prediction log")] = None,
+    flan_prediction_log: Annotated[
+        Path | None, typer.Option(help="Flan-T5 prediction log")
+    ] = None,
+    opus_prediction_log: Annotated[
+        Path | None, typer.Option(help="OPUS-MT prediction log")
+    ] = None,
+) -> None:
+    """Select among BART, Flan-T5, and OPUS-MT using the same held-out gates."""
+    reports = {
+        "bart": resolve_path(bart),
+        "flan_t5_small": resolve_path(flan),
+        "opus_mt_gem_gem": resolve_path(opus),
+    }
+    training = {
+        name: resolve_path(path)
+        for name, path in (
+            ("bart", bart_training),
+            ("flan_t5_small", flan_training),
+            ("opus_mt_gem_gem", opus_training),
+        )
+        if path is not None
+    }
+    prediction_logs = {
+        name: resolve_path(path)
+        for name, path in (
+            ("bart", bart_prediction_log),
+            ("flan_t5_small", flan_prediction_log),
+            ("opus_mt_gem_gem", opus_prediction_log),
+        )
+        if path is not None
+    }
+    _emit(
+        compare_rewrite_evaluations(
+            reports,
+            resolve_path(output),
+            training_report_paths=training,
+            prediction_log_paths=prediction_logs,
+        )
+    )
+
+
 @app.command("review-rewrite-models")
 def review_rewrite_models_command(
     adapter: Annotated[Path, typer.Option(help="Private adapter prediction JSONL")],
@@ -639,6 +695,30 @@ def review_rewrite_models_command(
             {
                 "Pretrained BART LoRA": resolve_path(adapter),
                 "Legacy 291K Transformer": resolve_path(legacy),
+            },
+            resolve_path(output),
+            sample_size=sample_size,
+        )
+    )
+
+
+@app.command("review-seq2seq-models")
+def review_seq2seq_models_command(
+    bart: Annotated[Path, typer.Option(help="BART prediction JSONL")],
+    flan: Annotated[Path, typer.Option(help="Flan-T5 prediction JSONL")],
+    opus: Annotated[Path, typer.Option(help="OPUS-MT prediction JSONL")],
+    output: Annotated[Path, typer.Option(help="Private human comparison Markdown")] = Path(
+        "work/rewrite/reviews/seq2seq-comparison.md"
+    ),
+    sample_size: Annotated[int, typer.Option(min=1, max=200)] = 50,
+) -> None:
+    """Create a private blindable comparison of the three seq2seq candidates."""
+    _emit(
+        create_rewrite_comparison_review(
+            {
+                "BART Base LoRA": resolve_path(bart),
+                "Flan-T5 Small LoRA": resolve_path(flan),
+                "OPUS-MT gem-gem LoRA": resolve_path(opus),
             },
             resolve_path(output),
             sample_size=sample_size,

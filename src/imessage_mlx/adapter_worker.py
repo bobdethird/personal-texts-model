@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from imessage_mlx.config import load_yaml
+from imessage_mlx.seq2seq_profile import format_seq2seq_source, resolve_seq2seq_profile
 from imessage_mlx.utils import ensure_private_dir, read_jsonl, write_json, write_jsonl
 
 
@@ -19,6 +20,8 @@ def _chmod_private_tree(root: Path) -> None:
 
 
 def _device(torch):
+    if torch.cuda.is_available():
+        return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
@@ -36,7 +39,7 @@ def _qwen_model_reference(config: dict[str, Any]) -> str:
     return snapshot_download(model_id, revision=revision)
 
 
-def train_bart(
+def train_seq2seq(
     config_path: str | Path,
     data_dir: str | Path,
     output_dir: str | Path,
@@ -47,15 +50,18 @@ def train_bart(
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, DataCollatorForSeq2Seq
 
     config = load_yaml(config_path)
+    profile = resolve_seq2seq_profile(config)
     seed = int(config.get("seed", 42))
     random.seed(seed)
     torch.manual_seed(seed)
     device = _device(torch)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     output = ensure_private_dir(output_dir)
     train_rows = list(read_jsonl(Path(data_dir) / "train.jsonl"))
     valid_rows = list(read_jsonl(Path(data_dir) / "valid.jsonl"))
     if not train_rows or not valid_rows:
-        raise ValueError("BART adapter training requires non-empty train and valid JSONL")
+        raise ValueError("Seq2seq adapter training requires non-empty train and valid JSONL")
 
     base_model = str(config["base_model"])
     revision = str(config.get("revision", "main"))
@@ -64,7 +70,7 @@ def train_bart(
 
     def within_token_limit(row: dict[str, Any]) -> bool:
         source_ids = tokenizer(
-            str(row["source"]),
+            format_seq2seq_source(str(row["source"]), profile),
             add_special_tokens=True,
             truncation=False,
         )["input_ids"]
@@ -80,7 +86,7 @@ def train_bart(
     train_rows = [row for row in train_rows if within_token_limit(row)]
     valid_rows = [row for row in valid_rows if within_token_limit(row)]
     if not train_rows or not valid_rows:
-        raise ValueError("BART length filtering removed every train or validation example")
+        raise ValueError("Seq2seq length filtering removed every train or validation example")
     model = AutoModelForSeq2SeqLM.from_pretrained(base_model, revision=revision)
     model = get_peft_model(
         model,
@@ -90,7 +96,7 @@ def train_bart(
             r=int(config.get("lora_rank", 8)),
             lora_alpha=int(config.get("lora_alpha", 16)),
             lora_dropout=float(config.get("lora_dropout", 0.1)),
-            target_modules=["q_proj", "v_proj"],
+            target_modules=list(profile.lora_target_modules),
         ),
     )
     model.to(device)
@@ -105,7 +111,7 @@ def train_bart(
         def __getitem__(self, index: int) -> dict[str, list[int]]:
             row = self.rows[index]
             return tokenizer(
-                str(row["source"]),
+                format_seq2seq_source(str(row["source"]), profile),
                 text_target=str(row["target"]),
                 max_length=max_length,
                 truncation=True,
@@ -196,12 +202,20 @@ def train_bart(
                 break
 
     elapsed = time.perf_counter() - started
-    peak_memory = int(torch.mps.driver_allocated_memory()) if device.type == "mps" else 0
+    if device.type == "cuda":
+        peak_memory = int(torch.cuda.max_memory_allocated())
+    elif device.type == "mps":
+        peak_memory = int(torch.mps.driver_allocated_memory())
+    else:
+        peak_memory = 0
     report = {
         "schema_version": 1,
-        "architecture": "bart",
+        "architecture": profile.architecture,
         "base_model": base_model,
         "base_revision": revision,
+        "base_model_license": profile.base_model_license,
+        "source_prefix": profile.source_prefix,
+        "lora_target_modules": list(profile.lora_target_modules),
         "train_examples": len(train_rows),
         "validation_examples": len(valid_rows),
         "skipped_oversized_train_examples": original_train_count - len(train_rows),
@@ -221,7 +235,7 @@ def train_bart(
     return report
 
 
-def predict_bart(
+def predict_seq2seq(
     config_path: str | Path,
     data_path: str | Path,
     adapter_dir: str | Path,
@@ -232,6 +246,7 @@ def predict_bart(
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     config = load_yaml(config_path)
+    profile = resolve_seq2seq_profile(config)
     device = _device(torch)
     base_model = str(config["base_model"])
     revision = str(config.get("revision", "main"))
@@ -248,7 +263,7 @@ def predict_bart(
         with torch.no_grad():
             for row in rows:
                 encoded = tokenizer(
-                    str(row["source"]),
+                    format_seq2seq_source(str(row["source"]), profile),
                     return_tensors="pt",
                     max_length=int(config.get("max_length", 256)),
                     truncation=True,
@@ -278,7 +293,7 @@ def predict_bart(
     count = write_jsonl(output_path, predictions())
     elapsed = time.perf_counter() - started
     return {
-        "architecture": "bart",
+        "architecture": profile.architecture,
         "predictions": count,
         "elapsed_seconds": elapsed,
         "examples_per_second": count / max(elapsed, 1e-9),
@@ -332,7 +347,7 @@ def predict_qwen(
     }
 
 
-def rewrite_bart(
+def rewrite_seq2seq(
     config_path: str | Path,
     adapter_dir: str | Path,
     draft: str,
@@ -342,6 +357,7 @@ def rewrite_bart(
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     config = load_yaml(config_path)
+    profile = resolve_seq2seq_profile(config)
     device = _device(torch)
     run = Path(adapter_dir)
     tokenizer = AutoTokenizer.from_pretrained(run / "tokenizer")
@@ -353,7 +369,7 @@ def rewrite_bart(
     model.to(device)
     model.eval()
     encoded = tokenizer(
-        draft,
+        format_seq2seq_source(draft, profile),
         return_tensors="pt",
         max_length=int(config.get("max_length", 256)),
         truncation=True,
@@ -367,6 +383,11 @@ def rewrite_bart(
             max_new_tokens=int(config.get("max_new_tokens", 64)),
         )
     return tokenizer.decode(generated[0], skip_special_tokens=True).strip()
+
+
+train_bart = train_seq2seq
+predict_bart = predict_seq2seq
+rewrite_bart = rewrite_seq2seq
 
 
 def rewrite_qwen(
@@ -560,12 +581,15 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in (
         "train-bart",
+        "train-seq2seq",
         "predict-bart",
+        "predict-seq2seq",
         "predict-qwen",
         "semantic-eval",
         "convergence-data-semantics",
         "repair-qwen",
         "rewrite-bart",
+        "rewrite-seq2seq",
         "rewrite-qwen",
     ):
         subparser = subparsers.add_parser(command)
@@ -588,14 +612,14 @@ def main() -> None:
             subparser.add_argument("--limit", required=True, type=int)
             continue
         subparser.add_argument("--config", required=True)
-        if command == "train-bart":
+        if command in {"train-bart", "train-seq2seq"}:
             subparser.add_argument("--data", required=True)
         else:
             subparser.add_argument("--data", required=True)
             subparser.add_argument("--adapter", required=True)
     arguments = parser.parse_args()
-    if arguments.command == "rewrite-bart":
-        print(rewrite_bart(arguments.config, arguments.adapter, arguments.draft))
+    if arguments.command in {"rewrite-bart", "rewrite-seq2seq"}:
+        print(rewrite_seq2seq(arguments.config, arguments.adapter, arguments.draft))
         return
     if arguments.command == "rewrite-qwen":
         print(rewrite_qwen(arguments.config, arguments.adapter, arguments.draft))
@@ -617,10 +641,15 @@ def main() -> None:
             arguments.report,
             limit=arguments.limit,
         )
-    elif arguments.command == "train-bart":
-        report = train_bart(arguments.config, arguments.data, arguments.output)
-    elif arguments.command == "predict-bart":
-        report = predict_bart(arguments.config, arguments.data, arguments.adapter, arguments.output)
+    elif arguments.command in {"train-bart", "train-seq2seq"}:
+        report = train_seq2seq(arguments.config, arguments.data, arguments.output)
+    elif arguments.command in {"predict-bart", "predict-seq2seq"}:
+        report = predict_seq2seq(
+            arguments.config,
+            arguments.data,
+            arguments.adapter,
+            arguments.output,
+        )
     else:
         report = predict_qwen(arguments.config, arguments.data, arguments.adapter, arguments.output)
     print(report)

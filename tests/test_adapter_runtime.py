@@ -29,9 +29,12 @@ def test_promotion_requires_passing_evaluation_and_hashes_artifact(tmp_path: Pat
     write_json(
         adapter / "training-report.json",
         {
-            "architecture": "bart",
-            "base_model": "facebook/bart-base",
+            "architecture": "flan_t5",
+            "base_model": "google/flan-t5-small",
             "base_revision": "pinned-revision",
+            "base_model_license": "apache-2.0",
+            "source_prefix": "rewrite: ",
+            "lora_target_modules": ["q", "v"],
         },
     )
     evaluation = tmp_path / "evaluation.json"
@@ -55,7 +58,10 @@ def test_promotion_requires_passing_evaluation_and_hashes_artifact(tmp_path: Pat
     assert manifest["pretrained_weights_used"] is True
     assert manifest["adapter_fused"] is False
     assert manifest["base_revision"] == "pinned-revision"
-    assert manifest["base_model_license"] == "not_declared_in_hugging_face_model_card"
+    assert manifest["base_model_license"] == "apache-2.0"
+    assert manifest["architecture"] == "flan_t5"
+    assert manifest["source_prefix"] == "rewrite: "
+    assert manifest["lora_target_modules"] == ["q", "v"]
 
     (tmp_path / "final/old-marker").write_text("rollback")
     second = promote_adapter(adapter, evaluation, tmp_path / "final")
@@ -120,3 +126,46 @@ def test_qwen_training_masks_prompt_in_isolated_environment(
 
     assert "--mask-prompt" in captured[-1]
     assert captured[-1][captured[-1].index("--data") + 1].endswith("/data/mlx")
+
+
+@pytest.mark.parametrize(
+    ("architecture", "expected_command"),
+    (("bart", "train-bart"), ("flan_t5", "train-seq2seq"), ("marian", "train-seq2seq")),
+)
+def test_seq2seq_training_uses_shared_data_and_worker(
+    tmp_path: Path,
+    monkeypatch,
+    architecture: str,
+    expected_command: str,
+) -> None:
+    config = tmp_path / f"{architecture}.yaml"
+    config.write_text(
+        "\n".join(
+            (
+                f"architecture: {architecture}",
+                "base_model: local/model",
+                "revision: pinned",
+            )
+        )
+    )
+    python = tmp_path / "env/bin/python"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    captured: list[list[str]] = []
+
+    def fake_run(command, **_options):
+        captured.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("imessage_mlx.adapter_runtime._run", fake_run)
+
+    train_adapter(
+        config,
+        tmp_path / "data",
+        tmp_path / "run",
+        tmp_path / "env",
+        project_root=tmp_path,
+    )
+
+    assert expected_command in captured[-1]
+    assert captured[-1][captured[-1].index("--data") + 1].endswith("/data/bart")

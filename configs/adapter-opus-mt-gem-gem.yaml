@@ -1,0 +1,22 @@
+name: opus-mt-gem-gem-lora
+architecture: marian
+base_model: Helsinki-NLP/opus-mt-gem-gem
+revision: 2aa5dfe55764a6de47d132182b853345066806ae
+base_model_license: license_provenance_requires_review
+source_prefix: ">>eng<< "
+lora_target_modules:
+  - q_proj
+  - v_proj
+max_length: 256
+max_new_tokens: 64
+batch_size: 2
+gradient_accumulation_steps: 8
+epochs: 3
+learning_rate: 0.0002
+weight_decay: 0.01
+warmup_fraction: 0.05
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.1
+early_stopping_patience: 2
+seed: 42

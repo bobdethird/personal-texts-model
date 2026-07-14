@@ -1,0 +1,22 @@
+name: flan-t5-small-lora
+architecture: flan_t5
+base_model: google/flan-t5-small
+revision: 0fc9ddf78a1e988dac52e2dac162b0ede4fd74ab
+base_model_license: apache-2.0
+source_prefix: "rewrite in the learned personal texting style while preserving meaning: "
+lora_target_modules:
+  - q
+  - v
+max_length: 256
+max_new_tokens: 64
+batch_size: 2
+gradient_accumulation_steps: 8
+epochs: 3
+learning_rate: 0.0002
+weight_decay: 0.01
+warmup_fraction: 0.05
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.1
+early_stopping_patience: 2
+seed: 42

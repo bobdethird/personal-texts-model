@@ -382,6 +382,70 @@ uv run imessage-mlx promote-adapter \
 uv run imessage-mlx rewrite-adapter "I will be there at seven."
 ```
 
+### Compact seq2seq competition
+
+Two compact challengers can reuse the exact BART `source`/`target` JSONL splits and evaluation
+gates:
+
+- `google/flan-t5-small` (77M parameters), using an explicit rewrite instruction prefix.
+- `Helsinki-NLP/opus-mt-gem-gem` (64M parameters), using `>>eng<<` because English is one of the
+  checkpoint's Germanic target languages.
+
+The OPUS checkpoint is a translation transfer experiment, not an English-to-English pretrained
+model. Its Hugging Face metadata says Apache-2.0, while upstream OPUS/Tatoeba provenance is
+inconsistent; keep the experiment local and review licensing before any distribution.
+
+Both candidates use the PyTorch/PEFT environment:
+
+```bash
+uv run imessage-mlx setup-adapter-environment flan_t5 --output work/envs/seq2seq
+
+uv run imessage-mlx train-adapter \
+  --config configs/adapter-flan-t5-small.yaml \
+  --environment work/envs/seq2seq \
+  --data work/rewrite/adapters \
+  --output outputs/adapters/flan-t5-small
+
+uv run imessage-mlx train-adapter \
+  --config configs/adapter-opus-mt-gem-gem.yaml \
+  --environment work/envs/seq2seq \
+  --data work/rewrite/adapters \
+  --output outputs/adapters/opus-mt-gem-gem
+```
+
+The two training commands may run concurrently on separate machines. Running both at once on one
+Mac shares unified memory and compute, so their elapsed-time and peak-memory results are not a fair
+efficiency comparison. Quality remains comparable if both complete against unchanged splits.
+
+Generate and score held-out predictions separately, then select only among candidates that pass
+the existing content, semantic, style, and fluency gates:
+
+```bash
+uv run imessage-mlx predict-adapter \
+  --config configs/adapter-flan-t5-small.yaml \
+  --environment work/envs/seq2seq \
+  --adapter outputs/adapters/flan-t5-small \
+  --output work/rewrite/evaluation/flan-t5-small.jsonl
+
+uv run imessage-mlx predict-adapter \
+  --config configs/adapter-opus-mt-gem-gem.yaml \
+  --environment work/envs/seq2seq \
+  --adapter outputs/adapters/opus-mt-gem-gem \
+  --output work/rewrite/evaluation/opus-mt-gem-gem.jsonl
+
+# After creating each standard evaluation and semantic report:
+uv run imessage-mlx compare-seq2seq-evaluations \
+  --bart work/rewrite/evaluation/bart-full-report.json \
+  --flan work/rewrite/evaluation/flan-t5-small-report.json \
+  --opus work/rewrite/evaluation/opus-mt-gem-gem-report.json \
+  --output work/rewrite/evaluation/seq2seq-selection.json
+
+uv run imessage-mlx review-seq2seq-models \
+  --bart work/rewrite/evaluation/bart-full.jsonl \
+  --flan work/rewrite/evaluation/flan-t5-small.jsonl \
+  --opus work/rewrite/evaluation/opus-mt-gem-gem.jsonl
+```
+
 Promotion is blocked unless the held-out content, style, fluency, and memorization checks pass. A
 previous promoted artifact is moved to a timestamped rollback directory. Review every generated
 message and complete the private comparison checklist before replacing the baseline; no command
