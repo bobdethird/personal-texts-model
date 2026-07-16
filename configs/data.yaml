@@ -14,5 +14,6 @@ redaction:
   emails: true
   phone_numbers: true
 include_attachment_marker: true
+include_contact_names: true
 minimum_body_recovery_rate: 0.90
 seed: 42

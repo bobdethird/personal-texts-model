@@ -209,26 +209,16 @@ def evaluate_convergence_predictions(
         raise ValueError("Pass only one aggregate semantic report")
     records, groups = _validate_predictions(list(read_jsonl(predictions_path)))
     training_targets = _training_targets(train_targets_path)
-    known_targets = {
-        normalized_fingerprint(value) for value in training_targets if value.strip()
-    }
-    training_8grams = {
-        ngram for value in training_targets for ngram in _word_ngrams(value)
-    }
+    known_targets = {normalized_fingerprint(value) for value in training_targets if value.strip()}
+    training_8grams = {ngram for value in training_targets for ngram in _word_ngrams(value)}
 
-    per_style_rows: dict[str, list[dict[str, float | bool]]] = {
-        style: [] for style in STYLE_KINDS
-    }
+    per_style_rows: dict[str, list[dict[str, float | bool]]] = {style: [] for style in STYLE_KINDS}
     group_fact_matches: list[bool] = []
     group_agreements: list[float] = []
     input_variances: list[float] = []
     output_variances: list[float] = []
-    input_marker_variances: dict[str, list[float]] = {
-        name: [] for name in _MARKER_NAMES
-    }
-    output_marker_variances: dict[str, list[float]] = {
-        name: [] for name in _MARKER_NAMES
-    }
+    input_marker_variances: dict[str, list[float]] = {name: [] for name in _MARKER_NAMES}
+    output_marker_variances: dict[str, list[float]] = {name: [] for name in _MARKER_NAMES}
     fact_failure_types: Counter[str] = Counter()
     source_target_fact_conflicts = 0
     groups_with_memorized_output = 0
@@ -259,11 +249,7 @@ def evaluate_convergence_predictions(
             target_facts = protected_facts(row["target"])
             generated_facts = protected_facts(row["generated"])
             source_target_match = source_facts == target_facts
-            fact_match = (
-                bool(row["generated"].strip())
-                and source_facts == generated_facts
-                and target_facts == generated_facts
-            )
+            fact_match = bool(row["generated"].strip()) and target_facts == generated_facts
             if not source_target_match:
                 source_target_fact_conflicts += 1
             if not fact_match:
@@ -316,28 +302,18 @@ def evaluate_convergence_predictions(
         values = per_style_rows[style]
         per_style[style] = {
             "examples": len(values),
-            "protected_fact_preservation_rate": _mean(
-                [float(row["fact_match"]) for row in values]
-            ),
+            "protected_fact_preservation_rate": _mean([float(row["fact_match"]) for row in values]),
             "normalized_input_copies": sum(bool(row["input_copy"]) for row in values),
-            "normalized_input_copy_rate": _mean(
-                [float(row["input_copy"]) for row in values]
-            ),
-            "mean_target_similarity": _mean(
-                [float(row["target_similarity"]) for row in values]
-            ),
-            "mean_source_similarity": _mean(
-                [float(row["source_similarity"]) for row in values]
-            ),
+            "normalized_input_copy_rate": _mean([float(row["input_copy"]) for row in values]),
+            "mean_target_similarity": _mean([float(row["target_similarity"]) for row in values]),
+            "mean_source_similarity": _mean([float(row["source_similarity"]) for row in values]),
             "mean_style_distance_from_target": _mean(
                 [float(row["output_style_distance"]) for row in values]
             ),
             "mean_style_proximity_to_target": _mean(
                 [float(row["output_style_proximity"]) for row in values]
             ),
-            "mean_style_gap_closed": _mean(
-                [float(row["style_gap_closed"]) for row in values]
-            ),
+            "mean_style_gap_closed": _mean([float(row["style_gap_closed"]) for row in values]),
             "mean_within_target_output_agreement": _mean(
                 [float(row["sibling_agreement"]) for row in values]
             ),
@@ -361,9 +337,30 @@ def evaluate_convergence_predictions(
     output_variance = _mean(output_variances)
     marker_reduction = input_variance - output_variance
     marker_reduction_rate = (
-        1.0 if input_variance == 0 and output_variance == 0
+        1.0
+        if input_variance == 0 and output_variance == 0
         else marker_reduction / max(input_variance, 1e-12)
     )
+    semantic_evidence = _load_json(
+        semantic_report if semantic_report is not None else semantic_report_path
+    )
+    semantic_mean = _semantic_mean(semantic_evidence)
+    semantic_low = _semantic_low_count(semantic_evidence)
+    fact_rate = _mean([float(value) for value in group_fact_matches])
+    copy_rate = _mean([float(row["input_copy"]) for row in all_rows])
+    agreement = _mean(group_agreements)
+    promotion_gates = {
+        "protected_facts": fact_rate >= 0.98,
+        "semantic_evidence": semantic_mean is not None
+        and semantic_mean >= 0.90
+        and (semantic_low is None or semantic_low <= max(1, math.ceil(len(records) * 0.05))),
+        "input_copy_rate": copy_rate <= 0.20,
+        "within_target_convergence": agreement >= 0.70,
+        "style_gap_closed": _mean([float(row["style_gap_closed"]) for row in all_rows]) > 0,
+        "fluency": not any(
+            bool(row[key]) for row in all_rows for key in ("empty", "repetition", "structural")
+        ),
+    }
     report = {
         "schema_version": 1,
         "task": "convergence_evaluation",
@@ -378,29 +375,20 @@ def evaluate_convergence_predictions(
             "complete_groups": True,
         },
         "content": {
-            "protected_fact_preservation_rate": _mean(
-                [float(value) for value in group_fact_matches]
-            ),
+            "protected_fact_preservation_rate": fact_rate,
             "protected_fact_preserved_groups": sum(group_fact_matches),
-            "protected_fact_failed_groups": len(group_fact_matches)
-            - sum(group_fact_matches),
+            "protected_fact_failed_groups": len(group_fact_matches) - sum(group_fact_matches),
             "row_protected_fact_preservation_rate": _mean(
                 [float(row["fact_match"]) for row in all_rows]
             ),
             "protected_fact_failure_types": dict(sorted(fact_failure_types.items())),
             "source_target_fact_conflict_rows": source_target_fact_conflicts,
-            "mean_target_similarity": _mean(
-                [float(row["target_similarity"]) for row in all_rows]
-            ),
-            "mean_source_similarity": _mean(
-                [float(row["source_similarity"]) for row in all_rows]
-            ),
+            "mean_target_similarity": _mean([float(row["target_similarity"]) for row in all_rows]),
+            "mean_source_similarity": _mean([float(row["source_similarity"]) for row in all_rows]),
         },
         "copying": {
             "normalized_input_copies": sum(bool(row["input_copy"]) for row in all_rows),
-            "normalized_input_copy_rate": _mean(
-                [float(row["input_copy"]) for row in all_rows]
-            ),
+            "normalized_input_copy_rate": copy_rate,
             "by_style": {
                 style: {
                     "count": per_style[style]["normalized_input_copies"],
@@ -419,9 +407,7 @@ def evaluate_convergence_predictions(
             "mean_input_distance_from_target": _mean(
                 [float(row["input_style_distance"]) for row in all_rows]
             ),
-            "mean_gap_closed": _mean(
-                [float(row["style_gap_closed"]) for row in all_rows]
-            ),
+            "mean_gap_closed": _mean([float(row["style_gap_closed"]) for row in all_rows]),
             "input_marker_variance_across_styles": input_variance,
             "output_marker_variance_across_styles": output_variance,
             "marker_variance_reduction": marker_reduction,
@@ -437,7 +423,7 @@ def evaluate_convergence_predictions(
         "convergence": {
             "similarity_helper": "casefolded_sequence_matcher",
             "pairs_per_group": math.comb(len(STYLE_KINDS), 2),
-            "mean_within_target_output_pairwise_agreement": _mean(group_agreements),
+            "mean_within_target_output_pairwise_agreement": agreement,
             "minimum_target_group_pairwise_agreement": min(group_agreements),
         },
         "per_style": per_style,
@@ -457,17 +443,13 @@ def evaluate_convergence_predictions(
                 style: {
                     "empty_outputs": per_style[style]["empty_outputs"],
                     "repeated_word_outputs": per_style[style]["repeated_word_outputs"],
-                    "structural_token_outputs": per_style[style][
-                        "structural_token_outputs"
-                    ],
+                    "structural_token_outputs": per_style[style]["structural_token_outputs"],
                 }
                 for style in STYLE_KINDS
             },
         },
         "memorization": {
-            "exact_training_target_matches": sum(
-                bool(row["exact_memorized"]) for row in all_rows
-            ),
+            "exact_training_target_matches": sum(bool(row["exact_memorized"]) for row in all_rows),
             "exact_long_training_target_matches": sum(
                 bool(row["long_memorized"]) for row in all_rows
             ),
@@ -477,9 +459,9 @@ def evaluate_convergence_predictions(
             "target_groups_with_exact_training_target_match": groups_with_memorized_output,
             "training_text_persisted_in_report": False,
         },
-        "semantic": _load_json(
-            semantic_report if semantic_report is not None else semantic_report_path
-        ),
+        "semantic": semantic_evidence,
+        "promotion_gates": promotion_gates,
+        "ready_to_promote": all(promotion_gates.values()),
         "message_text_persisted_in_report": False,
     }
     write_json(output_path, report)
@@ -562,15 +544,10 @@ def compare_convergence_evaluations(
     )
     baseline_challenge = baseline.get("challenge")
     augmented_challenge = augmented.get("challenge")
-    if not isinstance(baseline_challenge, Mapping) or not isinstance(
-        augmented_challenge, Mapping
-    ):
+    if not isinstance(baseline_challenge, Mapping) or not isinstance(augmented_challenge, Mapping):
         raise ValueError("Convergence reports require challenge metadata")
     challenge_keys = ("fingerprint", "target_groups", "examples", "styles")
-    if any(
-        baseline_challenge.get(key) != augmented_challenge.get(key)
-        for key in challenge_keys
-    ):
+    if any(baseline_challenge.get(key) != augmented_challenge.get(key) for key in challenge_keys):
         raise ValueError(
             "Baseline and augmented reports must evaluate the same target/style challenge"
         )
@@ -579,21 +556,15 @@ def compare_convergence_evaluations(
     baseline_semantic = _load_json(baseline_semantic_report)
     augmented_semantic = _load_json(augmented_semantic_report)
     if aggregate_semantic is not None:
-        if baseline_semantic is None and isinstance(
-            aggregate_semantic.get("baseline"), Mapping
-        ):
+        if baseline_semantic is None and isinstance(aggregate_semantic.get("baseline"), Mapping):
             baseline_semantic = dict(aggregate_semantic["baseline"])
-        if augmented_semantic is None and isinstance(
-            aggregate_semantic.get("augmented"), Mapping
-        ):
+        if augmented_semantic is None and isinstance(aggregate_semantic.get("augmented"), Mapping):
             augmented_semantic = dict(aggregate_semantic["augmented"])
     baseline_semantic = baseline_semantic or (
         dict(baseline["semantic"]) if isinstance(baseline.get("semantic"), Mapping) else None
     )
     augmented_semantic = augmented_semantic or (
-        dict(augmented["semantic"])
-        if isinstance(augmented.get("semantic"), Mapping)
-        else None
+        dict(augmented["semantic"]) if isinstance(augmented.get("semantic"), Mapping) else None
     )
 
     explicit_semantic_result = (
@@ -614,14 +585,12 @@ def compare_convergence_evaluations(
         )
         semantic_passed = bool(
             semantic_evidence_available
-            and augmented_semantic_mean
-            >= baseline_semantic_mean - material_semantic_regression
+            and augmented_semantic_mean >= baseline_semantic_mean - material_semantic_regression
             and (
                 baseline_low is None
                 or augmented_low is None
                 or augmented_low
-                <= baseline_low
-                + max(1, math.ceil(int(augmented_challenge["examples"]) * 0.01))
+                <= baseline_low + max(1, math.ceil(int(augmented_challenge["examples"]) * 0.01))
             )
         )
 
@@ -631,20 +600,11 @@ def compare_convergence_evaluations(
     style_improvements = {
         "target_style_proximity": (
             float(augmented["style"]["mean_proximity_to_target"])
-            > float(baseline["style"]["mean_proximity_to_target"])
-            + measurable_improvement
+            > float(baseline["style"]["mean_proximity_to_target"]) + measurable_improvement
         ),
         "within_target_output_agreement": (
-            float(
-                augmented["convergence"][
-                    "mean_within_target_output_pairwise_agreement"
-                ]
-            )
-            > float(
-                baseline["convergence"][
-                    "mean_within_target_output_pairwise_agreement"
-                ]
-            )
+            float(augmented["convergence"]["mean_within_target_output_pairwise_agreement"])
+            > float(baseline["convergence"]["mean_within_target_output_pairwise_agreement"])
             + measurable_improvement
         ),
         "output_style_marker_variance": (
@@ -677,11 +637,7 @@ def compare_convergence_evaluations(
             "improvements": style_improvements,
         },
     }
-    reasons = [
-        name
-        for name, gate in gates.items()
-        if not bool(gate["passed"])
-    ]
+    reasons = [name for name, gate in gates.items() if not bool(gate["passed"])]
     expand_recommended = not reasons
     result = {
         "schema_version": 1,
@@ -704,10 +660,7 @@ def _evenly_selected(values: list[str], sample_size: int) -> list[str]:
         return []
     if selected == 1:
         return [values[-1]]
-    return [
-        values[round(index * (len(values) - 1) / (selected - 1))]
-        for index in range(selected)
-    ]
+    return [values[round(index * (len(values) - 1) / (selected - 1))] for index in range(selected)]
 
 
 def create_convergence_comparison_review(
@@ -736,9 +689,7 @@ def create_convergence_comparison_review(
     if output_path is None:
         raise ValueError("Convergence review output path is required")
 
-    loaded: dict[
-        str, tuple[list[dict[str, str]], dict[str, dict[str, dict[str, str]]]]
-    ] = {}
+    loaded: dict[str, tuple[list[dict[str, str]], dict[str, dict[str, dict[str, str]]]]] = {}
     for name, path in prediction_paths.items():
         loaded[str(name)] = _validate_predictions(list(read_jsonl(path)))
     model_names = list(loaded)
@@ -821,6 +772,220 @@ def create_convergence_comparison_review(
         "machine_summary": str(Path(summary_path)),
         "human_approval_required": True,
         "review_win_or_tie_threshold": 0.70,
+        "human_approved": False,
+        "reviewed_target_groups": 0,
+        "changed_fact_failures": None,
+        "review_instructions": (
+            "After reviewing the private Markdown, set human_approved=true, record at least "
+            "20 reviewed_target_groups, and set changed_fact_failures=0 only when accurate."
+        ),
+        "message_text_persisted_in_summary": False,
+        "message_text_persisted_only_in_private_review": True,
+    }
+    write_json(summary_path, summary)
+    return summary
+
+
+def create_convergence_pair_review(
+    pairs_path: str | Path,
+    output_path: str | Path,
+    *,
+    summary_path: str | Path | None = None,
+    sample_size: int = 20,
+) -> dict[str, Any]:
+    if sample_size <= 0:
+        raise ValueError("Convergence pair review sample size must be positive")
+    groups: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    targets: dict[str, str] = {}
+    metadata: dict[str, dict[str, Any]] = {}
+    for record in read_jsonl(pairs_path):
+        target_id = record.get("target_id")
+        style = record.get("variant_kind")
+        source = record.get("source")
+        target = record.get("target")
+        if (
+            not isinstance(target_id, str)
+            or style not in _STYLE_SET
+            or not isinstance(source, str)
+            or not isinstance(target, str)
+        ):
+            raise ValueError("Pair review requires target, source, target_id, and variant_kind")
+        if style in groups[target_id]:
+            raise ValueError(f"Duplicate review variant {style!r} for target {target_id!r}")
+        if target_id in targets and targets[target_id] != target:
+            raise ValueError(f"Inconsistent review target text for {target_id!r}")
+        targets[target_id] = target
+        metadata.setdefault(
+            target_id,
+            {
+                "context_bundle": record.get("context_bundle", {}),
+                "semantic": record.get("semantic", {}),
+                "grounding_stratum": record.get("grounding_stratum", "unknown"),
+                "generation_fingerprint": record.get("generation_fingerprint"),
+            },
+        )
+        groups[target_id][str(style)] = record
+    incomplete = [target_id for target_id, values in groups.items() if set(values) != _STYLE_SET]
+    if incomplete:
+        raise ValueError("Pair review requires complete four-source target groups")
+    selected_ids = _evenly_selected(sorted(groups), sample_size)
+    if not selected_ids:
+        raise ValueError("Pair review input contains no complete target groups")
+
+    lines = [
+        "# Private Blind-Pair Review",
+        "",
+        "Review source meaning against the authored target and conversation-resolved intent.",
+        "Reject a group if any source changes a fact, intent, negation, uncertainty, or emotion.",
+        "",
+    ]
+    for number, target_id in enumerate(selected_ids, start=1):
+        target_metadata = metadata[target_id]
+        context_bundle = target_metadata["context_bundle"]
+        semantic = target_metadata["semantic"]
+        lines.extend(
+            [
+                f"## Target group {number}",
+                "",
+                "**Authored target**",
+                f"<pre>{html.escape(targets[target_id])}</pre>",
+                "",
+                f"Grounding stratum: `{html.escape(str(target_metadata['grounding_stratum']))}`",
+                "",
+            ]
+        )
+        if isinstance(context_bundle, dict):
+            for title, field in (
+                ("Exact reply/thread context", "exact_links"),
+                ("Recent conversation turns", "recent_turns"),
+                ("Retrieved historical evidence", "retrieved_evidence"),
+            ):
+                values = context_bundle.get(field, [])
+                if not isinstance(values, list) or not values:
+                    continue
+                lines.extend([f"**{title}**", ""])
+                for value in values:
+                    if isinstance(value, dict):
+                        relation = str(value.get("relation", field))
+                        role = str(value.get("role", "unknown"))
+                        evidence_id = str(
+                            value.get("message_id")
+                            or ",".join(str(item) for item in value.get("message_ids", []))
+                            or "unidentified"
+                        )
+                        text = html.escape(str(value.get("text", "")))
+                        lines.extend(
+                            [
+                                f"- `{html.escape(evidence_id)}` / "
+                                f"`{html.escape(relation)}` / `{html.escape(role)}`",
+                                f"  <pre>{text}</pre>",
+                            ]
+                        )
+                lines.append("")
+            glossary = context_bundle.get("glossary_entries", [])
+            if isinstance(glossary, list) and glossary:
+                lines.extend(["**Approved glossary definitions**", ""])
+                for entry in glossary:
+                    if isinstance(entry, dict):
+                        lines.append(
+                            f"- **{html.escape(str(entry.get('term', '')))}**: "
+                            f"{html.escape(str(entry.get('definition', '')))}"
+                        )
+                lines.append("")
+        if isinstance(semantic, dict):
+            paraphrase = str(semantic.get("resolved_paraphrase", "")).strip()
+            if paraphrase:
+                lines.extend(
+                    [
+                        "**Resolved meaning**",
+                        f"<pre>{html.escape(paraphrase)}</pre>",
+                        "",
+                    ]
+                )
+            propositions = semantic.get("atomic_propositions", [])
+            lines.extend(["**Extracted semantic propositions**", ""])
+            if isinstance(propositions, list):
+                lines.extend(f"- {html.escape(str(proposition))}" for proposition in propositions)
+            entities = semantic.get("resolved_entities", [])
+            if isinstance(entities, list) and entities:
+                lines.extend(["", "**Resolved entities**", ""])
+                for entity in entities:
+                    if isinstance(entity, dict):
+                        evidence = ", ".join(str(value) for value in entity.get("evidence_ids", []))
+                        lines.append(
+                            f"- **{html.escape(str(entity.get('term', '')))}**: "
+                            f"{html.escape(str(entity.get('interpretation', '')))} "
+                            f"(evidence: `{html.escape(evidence)}`)"
+                        )
+            slang = semantic.get("slang_interpretations", [])
+            if isinstance(slang, list) and slang:
+                lines.extend(["", "**Slang and texting expressions**", ""])
+                for item in slang:
+                    if isinstance(item, dict):
+                        evidence = ", ".join(str(value) for value in item.get("evidence_ids", []))
+                        suffix = f" (evidence: `{html.escape(evidence)}`)" if evidence else ""
+                        lines.append(
+                            f"- **{html.escape(str(item.get('expression', '')))}** — "
+                            f"`{html.escape(str(item.get('scope', '')))}`: "
+                            f"{html.escape(str(item.get('interpretation', '')))}{suffix}"
+                        )
+            ambiguities = semantic.get("remaining_ambiguities", [])
+            if isinstance(ambiguities, list) and ambiguities:
+                lines.extend(["", "**Remaining ambiguities**", ""])
+                lines.extend(f"- {html.escape(str(value))}" for value in ambiguities)
+            lines.append("")
+        for style in STYLE_KINDS:
+            record = groups[target_id][style]
+            score = record.get("semantic_similarity")
+            score_text = (
+                f" — local score {float(score):.3f}" if isinstance(score, int | float) else ""
+            )
+            lines.extend(
+                [
+                    f"**{style}{score_text}**",
+                    f"<pre>{html.escape(str(record['source']))}</pre>",
+                    "",
+                ]
+            )
+        lines.extend(
+            [
+                "- [ ] All four sources preserve the target meaning",
+                "- [ ] The resolved meaning states what the target actually communicates",
+                "- [ ] Slang and in-group expressions are read and scoped correctly",
+                "- [ ] Every interpretation is supported by the displayed evidence",
+                "- [ ] Speech act, time, modality, uncertainty, and question intent are unchanged",
+                "- [ ] All four sources differ materially from the target wording",
+                "- [ ] Reject this group",
+                "",
+            ]
+        )
+
+    review_path = Path(output_path)
+    atomic_write_text(review_path, "\n".join(lines) + "\n")
+    if summary_path is None:
+        summary_path = review_path.with_suffix(".summary.json")
+    summary = {
+        "schema_version": 1,
+        "task": "private_blind_pair_review",
+        "complete_target_groups": len(groups),
+        "sampled_target_groups": len(selected_ids),
+        "selected_target_ids": selected_ids,
+        "private_review": str(review_path),
+        "human_approved": False,
+        "reviewed_target_groups": 0,
+        "semantic_or_fact_failures": None,
+        "generation_fingerprints": sorted(
+            {
+                str(value["generation_fingerprint"])
+                for value in metadata.values()
+                if value.get("generation_fingerprint")
+            }
+        ),
+        "review_instructions": (
+            "After reviewing the private Markdown, set human_approved=true, record the number "
+            "of reviewed_target_groups, and set semantic_or_fact_failures=0 only if every "
+            "approved group is evidence-grounded and meaning-preserving."
+        ),
         "message_text_persisted_in_summary": False,
         "message_text_persisted_only_in_private_review": True,
     }

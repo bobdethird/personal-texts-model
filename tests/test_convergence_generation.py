@@ -12,15 +12,21 @@ from imessage_mlx.data import convergence_generation
 from imessage_mlx.data.convergence_generation import (
     GeneratedVariant,
     GeneratedVariantBatch,
+    ResolvedEntity,
     ResumeCompatibilityError,
     SemanticExtraction,
+    SemanticFactConflictError,
+    SlangInterpretation,
+    StructuredOutputMissingError,
     StyleIdentifierMismatchError,
     TargetIdentifierMismatchError,
     deterministic_pair_id,
     generate_openai_convergence_data,
     select_convergence_targets,
+    semantic_repeats_original_wording,
     validate_generated_source,
     validate_generated_variant_batch,
+    validate_semantic_extraction,
 )
 from imessage_mlx.utils import read_jsonl, write_jsonl
 
@@ -56,6 +62,7 @@ def _semantic(
     return SemanticExtraction(
         target_id=target_id,
         speech_act="request",
+        resolved_paraphrase="I would like us to talk through the plan together.",
         atomic_propositions=["The speaker wants to discuss a plan."],
         entities=[],
         protected_literals=[],
@@ -216,6 +223,11 @@ def test_two_stage_generation_is_blind_private_structured_and_separately_metered
     )
     assert STYLED_TARGET in str(stage_a_call["input"])
     assert STYLED_TARGET not in str(stage_b_call["input"])
+    assert set(json.loads(str(stage_a_call["input"]))) == {
+        "context_bundle",
+        "styled_target",
+        "target_id",
+    }
     assert set(json.loads(str(stage_b_call["input"]))) == {"target_id", "semantic"}
 
     published = list(read_jsonl(output / "published.jsonl"))
@@ -223,6 +235,7 @@ def test_two_stage_generation_is_blind_private_structured_and_separately_metered
         convergence_generation.STYLE_KINDS
     )
     assert len({record["target_id"] for record in published}) == 1
+    assert all(record["generation_fingerprint"] for record in published)
     assert all(
         record["pair_id"] == deterministic_pair_id(record["target_id"], record["variant_kind"])
         for record in published
@@ -266,6 +279,172 @@ def test_exact_target_and_style_identifiers_are_required() -> None:
     )
     with pytest.raises(TargetIdentifierMismatchError):
         validate_generated_variant_batch(wrong_item_id, expected_target_id="expected")
+
+
+def test_resolved_entities_must_cite_context_bundle_evidence() -> None:
+    semantic = _semantic("target").model_copy(
+        update={
+            "resolved_entities": [
+                ResolvedEntity(
+                    term="Cercor",
+                    interpretation="The author's AI-agent project.",
+                    evidence_ids=["message-evidence"],
+                    confidence="high",
+                )
+            ]
+        }
+    )
+    context_bundle = {
+        "retrieved_evidence": [{"message_id": "message-evidence"}],
+        "exact_links": [],
+        "recent_turns": [],
+        "glossary_entries": [],
+    }
+
+    assert (
+        validate_semantic_extraction(
+            semantic,
+            expected_target_id="target",
+            context_bundle=context_bundle,
+        )
+        is semantic
+    )
+    with pytest.raises(SemanticFactConflictError):
+        validate_semantic_extraction(
+            semantic,
+            expected_target_id="target",
+            context_bundle={**context_bundle, "retrieved_evidence": []},
+        )
+
+
+def test_resolved_paraphrase_is_required_and_must_not_copy_target_wording() -> None:
+    with pytest.raises(StructuredOutputMissingError, match="resolved paraphrase"):
+        validate_semantic_extraction(
+            _semantic("target").model_copy(update={"resolved_paraphrase": "  "}),
+            expected_target_id="target",
+        )
+
+    target = "we could get dinner after the movie"
+    copied = _semantic("target").model_copy(
+        update={"resolved_paraphrase": "We could get dinner, after the movie!"}
+    )
+    assert semantic_repeats_original_wording(copied, target)
+
+    reworded = _semantic("target").model_copy(
+        update={"resolved_paraphrase": "I suggest having dinner once the movie ends."}
+    )
+    assert not semantic_repeats_original_wording(reworded, target)
+
+
+def test_slang_interpretations_are_scoped_grounded_and_target_anchored() -> None:
+    target = "ong we should demo cercor tonight brodie"
+
+    widespread = _semantic("target").model_copy(
+        update={
+            "slang_interpretations": [
+                SlangInterpretation(
+                    expression="ong",
+                    interpretation="A sincerity emphasis similar to 'honestly'.",
+                    scope="widespread",
+                ),
+                SlangInterpretation(
+                    expression="brodie",
+                    interpretation="A generic friendly address term like 'bro'.",
+                    scope="widespread",
+                ),
+            ]
+        }
+    )
+    assert (
+        validate_semantic_extraction(
+            widespread,
+            expected_target_id="target",
+            styled_target=target,
+        )
+        is widespread
+    )
+
+    ungrounded = _semantic("target").model_copy(
+        update={
+            "slang_interpretations": [
+                SlangInterpretation(
+                    expression="cercor",
+                    interpretation="The author's AI-agent project.",
+                    scope="in_group",
+                )
+            ]
+        }
+    )
+    with pytest.raises(SemanticFactConflictError, match="grounding evidence"):
+        validate_semantic_extraction(
+            ungrounded,
+            expected_target_id="target",
+            styled_target=target,
+        )
+
+    grounded = _semantic("target").model_copy(
+        update={
+            "slang_interpretations": [
+                SlangInterpretation(
+                    expression="cercor",
+                    interpretation="The author's AI-agent project that invokes tools.",
+                    scope="in_group",
+                    evidence_ids=["glossary-cercor"],
+                )
+            ]
+        }
+    )
+    bundle = {
+        "exact_links": [],
+        "recent_turns": [],
+        "retrieved_evidence": [],
+        "glossary_entries": [{"entry_id": "glossary-cercor", "evidence_message_ids": []}],
+    }
+    assert (
+        validate_semantic_extraction(
+            grounded,
+            expected_target_id="target",
+            styled_target=target,
+            context_bundle=bundle,
+        )
+        is grounded
+    )
+
+    unprotected = _semantic("target").model_copy(
+        update={
+            "slang_interpretations": [
+                SlangInterpretation(
+                    expression="ong",
+                    interpretation="Unclear whether this is emphasis or a nickname.",
+                    scope="uncertain",
+                )
+            ]
+        }
+    )
+    with pytest.raises(SemanticFactConflictError, match="protected literal"):
+        validate_semantic_extraction(
+            unprotected,
+            expected_target_id="target",
+            styled_target=target,
+        )
+
+    absent = _semantic("target").model_copy(
+        update={
+            "slang_interpretations": [
+                SlangInterpretation(
+                    expression="fr fr",
+                    interpretation="A sincerity emphasis.",
+                    scope="widespread",
+                )
+            ]
+        }
+    )
+    with pytest.raises(SemanticFactConflictError, match="absent from the target"):
+        validate_semantic_extraction(
+            absent,
+            expected_target_id="target",
+            styled_target=target,
+        )
 
 
 def test_partial_variant_resume_retries_only_missing_style_and_publishes_complete_group(
@@ -361,6 +540,26 @@ def test_target_selection_excludes_low_content_reactions(tmp_path: Path) -> None
     assert selected[0]["source_pair_id"] == "pair-2"
 
 
+def test_target_selection_accepts_context_bearing_unpaired_style_targets(tmp_path: Path) -> None:
+    splits = tmp_path / "splits"
+    target = {
+        "pair_id": "target-1",
+        "timestamp_ns": 1,
+        "styled_text": "yeah i can come after dinner",
+        "context": [{"role": "other", "text": "Can you come later?"}],
+    }
+    _write_splits(splits, train=[target], valid=[], test=[])
+
+    selected = select_convergence_targets(
+        splits,
+        allocation={"train": 1, "valid": 0, "test": 0},
+    )
+
+    assert selected[0]["target_text"] == target["styled_text"]
+    assert selected[0]["context"] == target["context"]
+    assert selected[0]["selection_stratum"].startswith("unpaired|")
+
+
 def test_context_ineligible_primary_is_backfilled_within_split(
     tmp_path: Path,
     monkeypatch,
@@ -403,3 +602,50 @@ def test_generated_sources_must_preserve_opaque_literals() -> None:
     )
 
     assert "protected_literal_conflict" in reasons
+
+
+def test_neutral_everyday_source_cannot_copy_the_styled_target() -> None:
+    semantic = _semantic("target")
+
+    reasons = validate_generated_source(
+        variant_kind="neutral_everyday",
+        target_text="yeah i can come after dinner",
+        source_text="Yeah, I can come after dinner.",
+        sibling_sources=[],
+        max_characters=512,
+        semantic=semantic,
+    )
+
+    assert "target_normalized_duplicate" in reasons
+
+
+def test_context_resolved_facts_validate_against_semantics_not_terse_target() -> None:
+    semantic = _semantic("target").model_copy(
+        update={
+            "numbers": ["7"],
+            "atomic_propositions": ["The proposed time of 7 is acceptable."],
+            "context_dependent": True,
+        }
+    )
+
+    reasons = validate_generated_source(
+        variant_kind="formal_professional",
+        target_text="yeah that works",
+        source_text="The proposed time of 7 works for me.",
+        sibling_sources=[],
+        max_characters=512,
+        semantic=semantic,
+    )
+
+    assert "protected_fact_conflict" not in reasons
+
+
+def test_semantic_extraction_must_keep_explicit_target_literals() -> None:
+    semantic = _semantic("target")
+
+    with pytest.raises(SemanticFactConflictError, match="target number"):
+        validate_semantic_extraction(
+            semantic,
+            expected_target_id="target",
+            styled_target="I can arrive at 7",
+        )

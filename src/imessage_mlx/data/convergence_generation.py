@@ -31,11 +31,12 @@ from imessage_mlx.utils import (
     write_jsonl,
 )
 
-CONVERGENCE_SCHEMA_VERSION = 1
-SEMANTIC_OUTPUT_SCHEMA_VERSION = "convergence-semantics-v1"
+CONVERGENCE_SCHEMA_VERSION = 2
+SEMANTIC_OUTPUT_SCHEMA_VERSION = "convergence-semantics-v4-slang"
 VARIANT_OUTPUT_SCHEMA_VERSION = "convergence-variants-v1"
-SEMANTIC_PROMPT_VERSION = "semantic-extraction-v5"
-VARIANT_PROMPT_VERSION = "blind-style-generation-v4"
+SEMANTIC_PROMPT_VERSION = "semantic-extraction-v11-widespread-calibration"
+VARIANT_PROMPT_VERSION = "blind-style-generation-v6-slang"
+SOURCE_VALIDATION_VERSION = "semantic-protected-facts-v4-grounded"
 
 STYLE_KINDS = (
     "formal_professional",
@@ -47,14 +48,48 @@ DEFAULT_SPLIT_ALLOCATION = {"train": 400, "valid": 50, "test": 50}
 SPLIT_ORDER = ("train", "valid", "test")
 
 SEMANTIC_EXTRACTION_INSTRUCTIONS = """
-Extract a canonical semantic representation of the supplied message. Do not rewrite, quote,
-paraphrase, or imitate its wording. Record only meaning needed to create semantically equivalent
-messages: speech act, atomic propositions, entities and protected literals, time references,
-numbers, negation, modality or uncertainty, question intent, emotion, and intensity.
+Extract a canonical semantic representation of the supplied target message. Earlier conversation
+turns may be supplied only to resolve what the target communicates. Do not include facts from the
+context unless the target affirms, rejects, requests, or otherwise communicates them. Do not
+rewrite, quote, paraphrase, or imitate the target wording. Record only meaning needed to create
+semantically equivalent messages: speech act, atomic propositions, entities and protected literals,
+time references, numbers, negation, modality or uncertainty, question intent, emotion, and
+intensity.
 
-Preserve unresolved pronouns and references without resolving them. Canonicalize common, unambiguous
-English texting abbreviations and slang such as "rn", "omw", "tryna", "prolly", "lol", "mb", and
-"aight"; record their ordinary meaning rather than their wording. Preserve grammatical perspective:
+Also emit resolved_paraphrase: one complete standard-English sentence (two only if unavoidable)
+that expresses everything the target communicates, written from the author's own perspective as a
+direct message. Use the context bundle to resolve references the evidence supports; keep genuinely
+unresolved pronouns unresolved. It must carry the same speech act, question intent, negation,
+numbers, modality, and emotion as the target while using noticeably different wording and sentence
+structure than the target. Never copy the target text into resolved_paraphrase.
+
+The context_bundle separates exact reply links, recent turns, locally retrieved historical evidence,
+and human-approved glossary entries. Prefer approved glossary definitions and exact links, then
+retrieved evidence, then chronological proximity. Historical evidence is a clue, not permission to
+add unrelated facts.
+
+For every project, coined term, person, or domain entity whose meaning you resolve beyond its literal
+surface form, emit a resolved_entities item. Cite only entry_id or message_id values present in the
+context bundle. Never invent evidence. Put anything that remains materially uncertain into
+remaining_ambiguities and preserve that uncertainty in the propositions.
+
+Texting fillers, abbreviations, slang, and idioms need explicit interpretation. For every expression
+you read beyond its literal dictionary words, add a slang_interpretations item containing its exact
+target wording, its meaning in this message, and its scope. Use scope "widespread" for slang shared
+across current English texting culture, including short abbreviations such as "rn", "omw", "ts"
+meaning this stuff, "sm" meaning so much, "ong", and "prolly"; idioms such as "imma keep it a stack";
+and generic friendly address terms such as "brodie", "bro", and "cuz". Record the ordinary meaning
+rather than the wording. Use scope "in_group" only for readings particular to the author's circle;
+these are usually proper nouns or coined names for the author's projects, tools, people, places, or
+running personal topics, or an address term when evidence shows it names one specific person rather
+than addressing a friend generically. in_group readings must cite glossary entry_id or context
+message_id evidence, and without such evidence you must not guess. Use scope "uncertain" when you
+cannot commit to one reading; then copy the expression verbatim into protected_literals, record the
+open question in remaining_ambiguities, and set eligible=false when that expression carries the core
+meaning. Pure tone markers such as "lol" or "tho" usually contribute emotion or intensity rather
+than propositions; record them there instead of inventing propositions.
+
+Preserve unresolved pronouns and references without resolving them. Preserve grammatical perspective:
 use I/me/my for the author, you/your for the addressee, we/our for the author plus others, and retain
 third-person pronouns, tense, modality, and ellipsis. Do not replace people with labels such as
 "speaker", "sender", "addressee", "recipient", "entity", or "unspecified actor" in propositions.
@@ -70,8 +105,10 @@ preserved naturally. Preserve target_id verbatim. Return only the requested stru
 
 BLIND_VARIANT_INSTRUCTIONS = """
 Generate four independently worded English source messages from the supplied semantic JSON.
-The original message is deliberately unavailable. Express exactly the supplied meaning without
-adding facts, resolving uncertainty, changing negation, or changing question intent.
+The original message is deliberately unavailable. Treat resolved_paraphrase as the primary
+statement of the complete meaning and the remaining fields as constraints on it. Express exactly
+that meaning without adding facts, resolving uncertainty, changing negation, or changing question
+intent. Do not copy resolved_paraphrase verbatim; each source must reword it.
 
 Write each source as the direct message itself, from the same grammatical perspective. Convert
 semantic role descriptions back into natural pronouns: the author is I/me/my, the addressee is
@@ -88,6 +125,8 @@ Return exactly one source for each of these labels:
 - terse_conversational: a concise standard-English formulation that retains every proposition
 
 Make the sources substantively different in wording and register, not punctuation-only variants.
+Express every slang_interpretations meaning in plain standard English suited to each register; never
+reproduce a slang surface form unless it also appears in protected_literals.
 Copy every protected_literal exactly as supplied in every source. Do not expand, translate, quote,
 define, normalize, or reinterpret protected literals. Verbose and formal variants may add connective
 wording but must not add politeness, urgency, certainty, timing, or other meaning. Terse variants must
@@ -99,12 +138,31 @@ structured output.
 _WORD_RE = re.compile(r"\b[\w']+\b", re.UNICODE)
 
 
+class ResolvedEntity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    term: str
+    interpretation: str
+    evidence_ids: list[str]
+    confidence: Literal["low", "medium", "high"]
+
+
+class SlangInterpretation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expression: str
+    interpretation: str
+    scope: Literal["widespread", "in_group", "uncertain"]
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
 class SemanticExtraction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["convergence-semantics-v1"] = SEMANTIC_OUTPUT_SCHEMA_VERSION
+    schema_version: Literal["convergence-semantics-v4-slang"] = SEMANTIC_OUTPUT_SCHEMA_VERSION
     target_id: str
     speech_act: str
+    resolved_paraphrase: str
     atomic_propositions: list[str] = Field(default_factory=list)
     entities: list[str] = Field(default_factory=list)
     protected_literals: list[str] = Field(default_factory=list)
@@ -115,6 +173,9 @@ class SemanticExtraction(BaseModel):
     question_intent: str | None = None
     emotion: str | None = None
     intensity: str
+    resolved_entities: list[ResolvedEntity] = Field(default_factory=list)
+    slang_interpretations: list[SlangInterpretation] = Field(default_factory=list)
+    remaining_ambiguities: list[str] = Field(default_factory=list)
     eligible: bool
     context_dependent: bool
     ineligibility_reason: str | None = None
@@ -157,6 +218,10 @@ class SemanticWordingLeakageError(RuntimeError):
     pass
 
 
+class SemanticFactConflictError(RuntimeError):
+    pass
+
+
 class ResumeCompatibilityError(RuntimeError):
     pass
 
@@ -170,15 +235,15 @@ SemanticValidator = Callable[
 def deterministic_pair_id(target_id: str, variant_kind: str) -> str:
     if variant_kind not in STYLE_KINDS:
         raise ValueError(f"Unknown convergence variant kind {variant_kind!r}")
-    return sha256_text(
-        f"convergence-pair:{CONVERGENCE_SCHEMA_VERSION}:{target_id}:{variant_kind}"
-    )[:24]
+    return sha256_text(f"convergence-pair:{CONVERGENCE_SCHEMA_VERSION}:{target_id}:{variant_kind}")[
+        :24
+    ]
 
 
 def _target_id(split: str, source_pair_id: str) -> str:
-    return sha256_text(
-        f"convergence-target:{CONVERGENCE_SCHEMA_VERSION}:{split}:{source_pair_id}"
-    )[:24]
+    return sha256_text(f"convergence-target:{CONVERGENCE_SCHEMA_VERSION}:{split}:{source_pair_id}")[
+        :24
+    ]
 
 
 def _canonical_json(value: Any) -> str:
@@ -207,15 +272,82 @@ def _parsed_model(response: Any, expected_type: type[BaseModel]) -> BaseModel:
     )
 
 
+def _context_evidence_ids(context_bundle: Mapping[str, Any] | None) -> set[str]:
+    if not context_bundle:
+        return set()
+    values: set[str] = set()
+    for field in ("exact_links", "recent_turns", "retrieved_evidence"):
+        records = context_bundle.get(field, [])
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            message_id = record.get("message_id")
+            if isinstance(message_id, str):
+                values.add(message_id)
+            message_ids = record.get("message_ids", [])
+            if isinstance(message_ids, list):
+                values.update(str(value) for value in message_ids)
+    glossary = context_bundle.get("glossary_entries", [])
+    if isinstance(glossary, list):
+        for entry in glossary:
+            if not isinstance(entry, Mapping):
+                continue
+            entry_id = entry.get("entry_id")
+            if isinstance(entry_id, str):
+                values.add(entry_id)
+            evidence_ids = entry.get("evidence_message_ids", [])
+            if isinstance(evidence_ids, list):
+                values.update(str(value) for value in evidence_ids)
+    return values
+
+
 def validate_semantic_extraction(
     semantic: SemanticExtraction,
     *,
     expected_target_id: str,
+    styled_target: str | None = None,
+    context_bundle: Mapping[str, Any] | None = None,
 ) -> SemanticExtraction:
     if semantic.target_id != expected_target_id:
         raise TargetIdentifierMismatchError("Stage A returned an unexpected target identifier")
     if semantic.schema_version != SEMANTIC_OUTPUT_SCHEMA_VERSION:
         raise ResumeCompatibilityError("Stage A returned an incompatible semantic schema version")
+    if not semantic.resolved_paraphrase.strip():
+        raise StructuredOutputMissingError("Stage A omitted the resolved paraphrase")
+    if styled_target is not None:
+        target_facts = protected_facts(styled_target)
+        semantic_numbers = tuple(str(value) for value in semantic.numbers)
+        if semantic_numbers != target_facts["numbers"]:
+            raise SemanticFactConflictError("Stage A changed explicit target numbers")
+        if target_facts["negated"] and not semantic.negation:
+            raise SemanticFactConflictError("Stage A omitted explicit target negation")
+    allowed_evidence = _context_evidence_ids(context_bundle)
+    for entity in semantic.resolved_entities:
+        if not entity.evidence_ids:
+            raise SemanticFactConflictError("Resolved entity omitted grounding evidence")
+        if any(evidence_id not in allowed_evidence for evidence_id in entity.evidence_ids):
+            raise SemanticFactConflictError("Resolved entity cited unknown grounding evidence")
+    protected_casefold = {literal.strip().casefold() for literal in semantic.protected_literals}
+    target_casefold = styled_target.casefold() if styled_target is not None else None
+    for slang in semantic.slang_interpretations:
+        expression = slang.expression.strip()
+        if not expression or not slang.interpretation.strip():
+            raise SemanticFactConflictError("Slang interpretation is missing wording or meaning")
+        if target_casefold is not None and expression.casefold() not in target_casefold:
+            raise SemanticFactConflictError(
+                "Slang interpretation references wording absent from the target"
+            )
+        if slang.scope == "in_group":
+            if not slang.evidence_ids:
+                raise SemanticFactConflictError("In-group slang requires grounding evidence")
+            if any(evidence_id not in allowed_evidence for evidence_id in slang.evidence_ids):
+                raise SemanticFactConflictError("In-group slang cited unknown grounding evidence")
+        if slang.scope == "uncertain" and expression.casefold() not in protected_casefold:
+            raise SemanticFactConflictError(
+                "Uncertain slang must be preserved verbatim as a protected literal"
+            )
     return semantic
 
 
@@ -226,13 +358,19 @@ def semantic_repeats_original_wording(
     original = styled_target.strip().casefold()
     if not original:
         return False
+    if _near_duplicate(styled_target, semantic.resolved_paraphrase):
+        return True
     narrative_values: list[str] = [
         semantic.speech_act,
+        semantic.resolved_paraphrase,
         *semantic.atomic_propositions,
         semantic.question_intent or "",
         semantic.emotion or "",
         semantic.intensity,
         semantic.ineligibility_reason or "",
+        *(entity.interpretation for entity in semantic.resolved_entities),
+        *(slang.interpretation for slang in semantic.slang_interpretations),
+        *semantic.remaining_ambiguities,
     ]
     return any(original in value.strip().casefold() for value in narrative_values if value.strip())
 
@@ -267,8 +405,26 @@ async def extract_target_semantics(
     model: str,
     target_id: str,
     styled_target: str,
+    context_bundle: Mapping[str, Any] | None = None,
+    context: list[dict[str, Any]] | None = None,
 ) -> tuple[SemanticExtraction, dict[str, int]]:
-    payload = {"target_id": target_id, "styled_target": styled_target}
+    if context_bundle is None and context is not None:
+        context_bundle = {
+            "schema_version": 1,
+            "exact_links": [
+                turn for turn in context if turn.get("relation") in {"reply_to", "thread_root"}
+            ],
+            "recent_turns": [
+                turn for turn in context if turn.get("relation") not in {"reply_to", "thread_root"}
+            ],
+            "retrieved_evidence": [],
+            "glossary_entries": [],
+        }
+    payload = {
+        "target_id": target_id,
+        "context_bundle": dict(context_bundle or {}),
+        "styled_target": styled_target,
+    }
     response = await client.responses.parse(
         model=model,
         instructions=SEMANTIC_EXTRACTION_INSTRUCTIONS,
@@ -278,7 +434,15 @@ async def extract_target_semantics(
     )
     parsed = _parsed_model(response, SemanticExtraction)
     assert isinstance(parsed, SemanticExtraction)
-    return validate_semantic_extraction(parsed, expected_target_id=target_id), _usage(response)
+    return (
+        validate_semantic_extraction(
+            parsed,
+            expected_target_id=target_id,
+            styled_target=styled_target,
+            context_bundle=context_bundle,
+        ),
+        _usage(response),
+    )
 
 
 async def generate_blind_variants(
@@ -342,20 +506,81 @@ def _load_split_candidates(
         counts["input_records"] += 1
         pair_id = record.get("pair_id")
         source = record.get("source")
-        target = record.get("target")
+        target = record.get("target", record.get("styled_text"))
+        context = record.get("context", [])
+        context_bundle = record.get("context_bundle")
+        if context_bundle is None:
+            context_bundle = {
+                "schema_version": 1,
+                "exact_links": [
+                    turn
+                    for turn in context
+                    if isinstance(turn, dict)
+                    and turn.get("relation") in {"reply_to", "thread_root"}
+                ],
+                "recent_turns": [
+                    turn
+                    for turn in context
+                    if isinstance(turn, dict)
+                    and turn.get("relation") not in {"reply_to", "thread_root"}
+                ],
+                "retrieved_evidence": [],
+                "glossary_entries": [],
+                "retriever": {"kind": "legacy_recent_context"},
+            }
+        bundle_lists_valid = isinstance(context_bundle, dict) and all(
+            isinstance(context_bundle.get(field, []), list)
+            for field in (
+                "exact_links",
+                "recent_turns",
+                "retrieved_evidence",
+                "glossary_entries",
+            )
+        )
+        temporal_context_valid = True
+        if isinstance(context_bundle, dict) and context_bundle.get("schema_version") == 2:
+            target_timestamp = record.get("timestamp_ns")
+            temporal_context_valid = isinstance(target_timestamp, int)
+            if temporal_context_valid:
+                for field in ("exact_links", "recent_turns", "retrieved_evidence"):
+                    for evidence in context_bundle.get(field, []):
+                        evidence_timestamp = (
+                            evidence.get("timestamp_ns") if isinstance(evidence, dict) else None
+                        )
+                        if (
+                            isinstance(evidence_timestamp, int)
+                            and evidence_timestamp >= target_timestamp
+                        ):
+                            temporal_context_valid = False
+                for entry in context_bundle.get("glossary_entries", []):
+                    valid_from = (
+                        entry.get("valid_from_timestamp_ns") if isinstance(entry, dict) else None
+                    )
+                    if isinstance(valid_from, int) and valid_from >= target_timestamp:
+                        temporal_context_valid = False
         if (
             not isinstance(pair_id, str)
             or not pair_id.strip()
-            or not isinstance(source, str)
-            or not source.strip()
             or not isinstance(target, str)
             or not target.strip()
+            or not isinstance(context, list)
+            or any(
+                not isinstance(turn, dict)
+                or turn.get("role") not in {"me", "other"}
+                or not isinstance(turn.get("text"), str)
+                or not str(turn["text"]).strip()
+                or turn.get("relation")
+                not in {None, "reply_to", "thread_root", "historical_retrieval"}
+                for turn in context
+            )
+            or not bundle_lists_valid
+            or not temporal_context_valid
         ):
             counts["excluded_invalid"] += 1
             continue
         pair_id = pair_id.strip()
         target = target.strip()
-        source = source.strip()
+        source = source.strip() if isinstance(source, str) else ""
         if pair_id in seen_pair_ids:
             raise ValueError(f"Duplicate accepted BART pair_id {pair_id!r} in {split}")
         seen_pair_ids.add(pair_id)
@@ -369,19 +594,30 @@ def _load_split_candidates(
         if len(target) < 10 or len(words) < 2:
             counts["excluded_low_content"] += 1
             continue
-        signal = classify_pair_signal(source, target)
+        signal = classify_pair_signal(source, target) if source else "unpaired"
+        if context_bundle["glossary_entries"]:
+            grounding = "glossary"
+        elif context_bundle["retrieved_evidence"]:
+            grounding = "historical"
+        elif context_bundle["exact_links"]:
+            grounding = "reply"
+        else:
+            grounding = "recent_or_none"
         candidates.append(
             {
                 "target_id": _target_id(split, pair_id),
                 "source_pair_id": pair_id,
                 "split": split,
                 "target_text": target,
+                "context": context,
+                "context_bundle": context_bundle,
                 "chronology_index": chronology_index,
                 "selection_stratum": "|".join(
                     (
                         signal,
                         "question" if "?" in target else "statement",
                         _length_band(target),
+                        grounding,
                     )
                 ),
             }
@@ -471,7 +707,7 @@ def _reserve_counts(
 ) -> dict[str, int]:
     if value is None:
         return {
-            split: (max(10, math.ceil(count * 0.25)) if count else 0)
+            split: (max(20, math.ceil(count * 0.50)) if count else 0)
             for split, count in allocation.items()
         }
     if isinstance(value, int) and not isinstance(value, bool):
@@ -505,10 +741,7 @@ def create_convergence_manifest(
     requested = _allocation(allocation)
     reserves = _reserve_counts(requested, reserve_per_split)
     root = Path(splits_dir)
-    input_hashes = {
-        split: sha256_file(root / f"{split}.jsonl")
-        for split in SPLIT_ORDER
-    }
+    input_hashes = {split: sha256_file(root / f"{split}.jsonl") for split in SPLIT_ORDER}
     input_fingerprint = sha256_text(_canonical_json(input_hashes))
 
     targets: list[dict[str, Any]] = []
@@ -557,6 +790,7 @@ def create_convergence_manifest(
             "stage_a": SEMANTIC_PROMPT_VERSION,
             "stage_b": VARIANT_PROMPT_VERSION,
         },
+        "source_validation_version": SOURCE_VALIDATION_VERSION,
         "prompt_hashes": {
             "stage_a": sha256_text(SEMANTIC_EXTRACTION_INSTRUCTIONS),
             "stage_b": sha256_text(BLIND_VARIANT_INSTRUCTIONS),
@@ -691,6 +925,8 @@ def _load_semantics(
         loaded[target_id] = validate_semantic_extraction(
             semantic,
             expected_target_id=target_id,
+            styled_target=str(candidates[target_id]["target_text"]),
+            context_bundle=candidates[target_id].get("context_bundle"),
         )
     return loaded
 
@@ -813,7 +1049,9 @@ def validate_generated_source(
         reasons.append("too_long")
     if STRUCTURAL_TOKEN_RE.search(candidate):
         reasons.append("structural_token")
-    if protected_facts(target_text) != protected_facts(candidate):
+    candidate_facts = protected_facts(candidate)
+    semantic_numbers = tuple(str(value) for value in semantic.numbers)
+    if candidate_facts["numbers"] != semantic_numbers:
         reasons.append("protected_fact_conflict")
     missing_literals = [
         literal
@@ -829,7 +1067,7 @@ def validate_generated_source(
         reasons.append("protected_literal_conflict")
 
     target_match = _near_duplicate(target_text, candidate)
-    if target_match and variant_kind != "neutral_everyday":
+    if target_match:
         reasons.append(f"target_{target_match}")
     else:
         target_tokens = set(_WORD_RE.findall(target_text.casefold()))
@@ -889,11 +1127,7 @@ def _active_targets(
     active: dict[str, list[dict[str, Any]]] = {split: [] for split in SPLIT_ORDER}
     for split in SPLIT_ORDER:
         pool = sorted(
-            (
-                target
-                for target in manifest["targets"]
-                if target["split"] == split
-            ),
+            (target for target in manifest["targets"] if target["split"] == split),
             key=lambda target: int(target["selection_rank"]),
         )
         for target in pool:
@@ -901,7 +1135,11 @@ def _active_targets(
             if target_id in excluded:
                 continue
             semantic = semantics.get(target_id)
-            if semantic is None or not semantic.eligible:
+            if (
+                semantic is None
+                or not semantic.eligible
+                or (semantic.context_dependent and not target.get("context"))
+            ):
                 continue
             active[split].append(target)
             if len(active[split]) == int(allocation[split]):
@@ -976,6 +1214,7 @@ async def generate_openai_convergence_data(
                 model=model,
                 target_id=str(target["target_id"]),
                 styled_target=str(target["target_text"]),
+                context_bundle=target.get("context_bundle"),
             )
 
     async def request_variants(
@@ -1048,10 +1287,7 @@ async def generate_openai_convergence_data(
             pending_targets = [
                 target
                 for target in targets
-                if any(
-                    (str(target["target_id"]), style) not in accepted
-                    for style in STYLE_KINDS
-                )
+                if any((str(target["target_id"]), style) not in accepted for style in STYLE_KINDS)
             ]
             if not pending_targets:
                 break
@@ -1088,8 +1324,7 @@ async def generate_openai_convergence_data(
                     style for style in STYLE_KINDS if (target_id, style) not in accepted
                 ]
                 new_sources = {
-                    style: by_style[style].source_text.strip()
-                    for style in missing_styles
+                    style: by_style[style].source_text.strip() for style in missing_styles
                 }
                 existing_sources = [
                     str(record["source"])
@@ -1139,11 +1374,7 @@ async def generate_openai_convergence_data(
 
     excluded_incomplete: set[str] = set()
     try:
-        primary_targets = [
-            target
-            for target in manifest["targets"]
-            if target["primary"]
-        ]
+        primary_targets = [target for target in manifest["targets"] if target["primary"]]
         await run_semantic_wave(primary_targets)
 
         while True:
@@ -1193,10 +1424,7 @@ async def generate_openai_convergence_data(
             incomplete = {
                 str(target["target_id"])
                 for target in active_targets
-                if any(
-                    (str(target["target_id"]), style) not in accepted
-                    for style in STYLE_KINDS
-                )
+                if any((str(target["target_id"]), style) not in accepted for style in STYLE_KINDS)
             }
             if not incomplete:
                 break
@@ -1232,12 +1460,15 @@ async def generate_openai_convergence_data(
                 "variant_kind": style,
                 "source": variant["source"],
                 "target": target["target_text"],
+                "generation_fingerprint": manifest["generation_fingerprint"],
             }
             published.append(published_record)
             evaluator_inputs.append(
                 {
                     **published_record,
                     "semantic": semantic.model_dump(mode="json"),
+                    "context_bundle": target.get("context_bundle", {}),
+                    "grounding_stratum": str(target["selection_stratum"]).rsplit("|", 1)[-1],
                     "local_validation": "passed",
                     "semantic_evaluator_status": (
                         "passed" if semantic_validator is not None else "pending"
@@ -1248,16 +1479,9 @@ async def generate_openai_convergence_data(
     write_jsonl(evaluator_path, evaluator_inputs)
 
     active_counts = {split: len(active[split]) for split in SPLIT_ORDER}
-    primary_ids = {
-        str(target["target_id"])
-        for target in manifest["targets"]
-        if target["primary"]
-    }
+    primary_ids = {str(target["target_id"]) for target in manifest["targets"] if target["primary"]}
     backfilled = {
-        split: sum(
-            str(target["target_id"]) not in primary_ids
-            for target in active[split]
-        )
+        split: sum(str(target["target_id"]) not in primary_ids for target in active[split])
         for split in SPLIT_ORDER
     }
     ineligible = sum(not semantic.eligible for semantic in semantics.values())
@@ -1305,6 +1529,7 @@ async def generate_openai_convergence_data(
                 and _near_duplicate(str(record["source"]), str(record["target"])) is not None
                 for record in published
             ),
+            "target_identity_rows_allowed": False,
         },
         "usage": run_usage,
         "cumulative_usage": cumulative_usage,

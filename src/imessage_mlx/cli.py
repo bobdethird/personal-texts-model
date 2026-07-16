@@ -27,6 +27,7 @@ from imessage_mlx.config import load_yaml, resolve_path
 from imessage_mlx.convergence_evaluation import (
     compare_convergence_evaluations,
     create_convergence_comparison_review,
+    create_convergence_pair_review,
     evaluate_convergence_predictions,
 )
 from imessage_mlx.data.adapters import (
@@ -34,6 +35,10 @@ from imessage_mlx.data.adapters import (
     prepare_convergence_adapter_datasets,
 )
 from imessage_mlx.data.convergence_generation import generate_openai_convergence_data
+from imessage_mlx.data.entity_glossary import (
+    create_entity_glossary_review,
+    propose_entity_glossary,
+)
 from imessage_mlx.data.extract import extract_messages
 from imessage_mlx.data.inspect_schema import inspect_schema
 from imessage_mlx.data.pair_generation import (
@@ -45,6 +50,8 @@ from imessage_mlx.data.rewrite import prepare_rewrite_dataset
 from imessage_mlx.data.sessions import build_sessions
 from imessage_mlx.data.snapshot import can_open_readonly, create_snapshot
 from imessage_mlx.data.split import split_sessions
+from imessage_mlx.data.style_targets import build_style_targets, split_style_targets
+from imessage_mlx.data.table_export import export_messages_csv
 from imessage_mlx.dataset import (
     encode_all_rewrite_splits,
     encode_all_splits,
@@ -175,6 +182,7 @@ def prepare_command(
         redaction=settings.get("redaction", {}),
         include_attachment_marker=bool(settings.get("include_attachment_marker", True)),
         minimum_body_recovery_rate=float(settings.get("minimum_body_recovery_rate", 0.90)),
+        include_contact_names=bool(settings.get("include_contact_names", False)),
     )
     sessions = build_sessions(
         work / "extracted/messages.jsonl",
@@ -194,6 +202,99 @@ def prepare_command(
         guard_days=int(split_settings.get("guard_days", 7)),
     )
     _emit({"extraction": extraction, "sessions": sessions, "split": split_report})
+
+
+@app.command("prepare-style-targets")
+def prepare_style_targets_command(
+    messages: Annotated[Path, typer.Option(help="Private extracted message JSONL")] = Path(
+        "work/extracted/messages.jsonl"
+    ),
+    targets: Annotated[Path, typer.Option(help="Private merged outgoing style targets")] = Path(
+        "work/rewrite/targets/targets.jsonl"
+    ),
+    splits: Annotated[Path, typer.Option(help="Private chronological target splits")] = Path(
+        "work/rewrite/targets/splits"
+    ),
+    extraction_report: Annotated[Path, typer.Option(help="Aggregate target report")] = Path(
+        "work/rewrite/targets/extraction-report.json"
+    ),
+    split_report: Annotated[Path, typer.Option(help="Aggregate target split report")] = Path(
+        "work/rewrite/targets/split-report.json"
+    ),
+    session_gap_minutes: Annotated[int, typer.Option(min=1)] = 360,
+    merge_gap_minutes: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="Experimental same-sender merge window; zero keeps one bubble per target",
+        ),
+    ] = 0,
+    context_turns: Annotated[int, typer.Option(min=0, max=20)] = 4,
+    retrieval_results: Annotated[int, typer.Option(min=0, max=20)] = 4,
+    max_retrieval_characters: Annotated[int, typer.Option(min=0)] = 1_200,
+    glossary: Annotated[Path | None, typer.Option(help="Approved private entity glossary")] = Path(
+        "work/rewrite/context/entity-glossary.json"
+    ),
+    guard_days: Annotated[int, typer.Option(min=0)] = 7,
+) -> None:
+    """Build context-bearing, pre-generation targets from merged outgoing turns."""
+    target_report = build_style_targets(
+        resolve_path(messages),
+        resolve_path(targets),
+        resolve_path(extraction_report),
+        session_gap_minutes=session_gap_minutes,
+        merge_gap_minutes=merge_gap_minutes,
+        context_turns=context_turns,
+        retrieval_results=retrieval_results,
+        max_retrieval_characters=max_retrieval_characters,
+        glossary_path=resolve_path(glossary) if glossary is not None else None,
+    )
+    split = split_style_targets(
+        resolve_path(targets),
+        resolve_path(splits),
+        resolve_path(split_report),
+        guard_days=guard_days,
+    )
+    _emit({"targets": target_report, "split": split})
+
+
+@app.command("propose-entity-glossary")
+def propose_entity_glossary_command(
+    messages: Annotated[Path, typer.Option(help="Private extracted message JSONL")] = Path(
+        "work/extracted/messages.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Private editable entity glossary")] = Path(
+        "work/rewrite/context/entity-glossary.json"
+    ),
+    report: Annotated[Path, typer.Option(help="Text-free glossary proposal report")] = Path(
+        "work/rewrite/context/entity-glossary-report.json"
+    ),
+    minimum_occurrences: Annotated[int, typer.Option(min=1)] = 2,
+    maximum_entries: Annotated[int, typer.Option(min=1)] = 200,
+) -> None:
+    """Propose evidence-backed private entity definitions for human approval."""
+    _emit(
+        propose_entity_glossary(
+            resolve_path(messages),
+            resolve_path(output),
+            resolve_path(report),
+            minimum_occurrences=minimum_occurrences,
+            maximum_entries=maximum_entries,
+        )
+    )
+
+
+@app.command("review-entity-glossary")
+def review_entity_glossary_command(
+    glossary: Annotated[Path, typer.Option(help="Private editable entity glossary")] = Path(
+        "work/rewrite/context/entity-glossary.json"
+    ),
+    output: Annotated[Path, typer.Option(help="Private entity glossary review Markdown")] = Path(
+        "work/rewrite/context/entity-glossary-review.md"
+    ),
+) -> None:
+    """Render glossary evidence before approving definitions."""
+    _emit(create_entity_glossary_review(resolve_path(glossary), resolve_path(output)))
 
 
 @app.command("prepare-rewrites")
@@ -257,8 +358,8 @@ def prepare_adapters_command(
 
 @app.command("generate-convergence-pilot")
 def generate_convergence_pilot_command(
-    splits: Annotated[Path, typer.Option(help="Accepted BART adapter split directory")] = Path(
-        "work/rewrite/adapters/bart"
+    splits: Annotated[Path, typer.Option(help="Chronological style-target split directory")] = Path(
+        "work/rewrite/targets/splits"
     ),
     output: Annotated[Path, typer.Option(help="Private convergence generation directory")] = Path(
         "work/rewrite/convergence/pilot"
@@ -309,16 +410,16 @@ def generate_convergence_pilot_command(
 @app.command("validate-convergence-data-semantics")
 def validate_convergence_data_semantics_command(
     environment: Annotated[Path, typer.Option(help="BART evaluation virtual environment")],
-    pairs: Annotated[Path, typer.Option(help="Generated convergence pair JSONL")] = Path(
-        "work/rewrite/convergence/pilot/published.jsonl"
-    ),
+    pairs: Annotated[
+        Path, typer.Option(help="Generated pairs with Stage A semantic references")
+    ] = (Path("work/rewrite/convergence/pilot/semantic-evaluation-inputs.jsonl")),
     output: Annotated[Path, typer.Option(help="Pairs with local semantic scores")] = Path(
         "work/rewrite/convergence/pilot/semantic-validated.jsonl"
     ),
     report: Annotated[Path, typer.Option(help="Aggregate semantic validation report")] = Path(
         "work/rewrite/convergence/pilot-semantic-report.json"
     ),
-    minimum_similarity: Annotated[float, typer.Option(min=-1.0, max=1.0)] = 0.25,
+    minimum_similarity: Annotated[float, typer.Option(min=-1.0, max=1.0)] = 0.70,
 ) -> None:
     """Score generated source-to-target meaning preservation locally."""
     _emit(
@@ -335,30 +436,45 @@ def validate_convergence_data_semantics_command(
 
 @app.command("prepare-convergence-adapters")
 def prepare_convergence_adapters_command(
-    base: Annotated[Path, typer.Option(help="Existing accepted BART data directory")] = Path(
-        "work/rewrite/adapters/bart"
-    ),
+    base: Annotated[
+        Path | None,
+        typer.Option(
+            help="Legacy direct-neutralization data; used only with --include-legacy-base"
+        ),
+    ] = None,
     pairs: Annotated[Path, typer.Option(help="Semantically scored convergence pairs")] = Path(
         "work/rewrite/convergence/pilot/semantic-validated.jsonl"
     ),
-    output: Annotated[Path, typer.Option(help="Augmented private adapter data root")] = Path(
+    output: Annotated[Path, typer.Option(help="Blind-generated private adapter data root")] = Path(
         "work/rewrite/convergence/adapters"
     ),
     report: Annotated[Path, typer.Option(help="Convergence adapter data report")] = Path(
         "work/rewrite/convergence/adapter-data-report.json"
     ),
-    minimum_similarity: Annotated[float, typer.Option(min=-1.0, max=1.0)] = 0.25,
-    minimum_group_mean: Annotated[float, typer.Option(min=-1.0, max=1.0)] = 0.50,
+    minimum_similarity: Annotated[float, typer.Option(min=-1.0, max=1.0)] = 0.70,
+    minimum_group_mean: Annotated[float, typer.Option(min=-1.0, max=1.0)] = 0.80,
+    include_legacy_base: Annotated[
+        bool,
+        typer.Option(help="Experimentally append the invalid direct-neutralization corpus"),
+    ] = False,
+    review_summary: Annotated[
+        Path | None,
+        typer.Option(help="Completed context-grounded pair review summary"),
+    ] = None,
 ) -> None:
-    """Merge complete convergence groups into leakage-clean BART data."""
+    """Publish complete, semantically gated blind-source groups for adapter training."""
     _emit(
         prepare_convergence_adapter_datasets(
-            resolve_path(base),
+            resolve_path(base) if base is not None else None,
             resolve_path(pairs),
             resolve_path(output),
             resolve_path(report),
             minimum_semantic_similarity=minimum_similarity,
             minimum_group_mean_similarity=minimum_group_mean,
+            include_legacy_base=include_legacy_base,
+            review_summary_path=(
+                resolve_path(review_summary) if review_summary is not None else None
+            ),
         )
     )
 
@@ -586,6 +702,26 @@ def review_convergence_models_command(
     )
 
 
+@app.command("review-convergence-pairs")
+def review_convergence_pairs_command(
+    pairs: Annotated[Path, typer.Option(help="Semantically scored blind pair JSONL")],
+    output: Annotated[Path, typer.Option(help="Private grouped pair review Markdown")] = Path(
+        "work/rewrite/convergence/reviews/pair-pilot.md"
+    ),
+    summary: Annotated[Path | None, typer.Option(help="Private review summary JSON")] = None,
+    sample_size: Annotated[int, typer.Option(min=1, max=200)] = 20,
+) -> None:
+    """Create a private review of blind sources before dataset expansion."""
+    _emit(
+        create_convergence_pair_review(
+            resolve_path(pairs),
+            resolve_path(output),
+            summary_path=resolve_path(summary) if summary else None,
+            sample_size=sample_size,
+        )
+    )
+
+
 @app.command("compare-rewrite-evaluations")
 def compare_rewrite_evaluations_command(
     bart: Annotated[Path, typer.Option(help="BART evaluation report")],
@@ -725,6 +861,10 @@ def review_seq2seq_models_command(
 def promote_adapter_command(
     adapter: Annotated[Path, typer.Option(help="Passing private adapter run directory")],
     evaluation: Annotated[Path, typer.Option(help="Passing rewrite evaluation report")],
+    review_summary: Annotated[
+        Path,
+        typer.Option(help="Completed human review JSON with approval and zero fact failures"),
+    ],
     config: Annotated[Path, typer.Option(help="Pinned adapter configuration YAML")] = Path(
         "configs/adapter-bart-base.yaml"
     ),
@@ -747,6 +887,7 @@ def promote_adapter_command(
             config_path=resolve_path(config),
             data_report_path=resolve_path(data_report),
             architecture_report_path=resolve_path(architecture_report),
+            review_summary_path=resolve_path(review_summary),
         )
     )
 
@@ -825,8 +966,23 @@ def generate_rewrite_pairs_command(
     batch_size: Annotated[int, typer.Option(min=1, max=100)] = 20,
     concurrency: Annotated[int, typer.Option(min=1, max=20)] = 4,
     max_characters: Annotated[int, typer.Option(min=1)] = 1_000,
+    allow_legacy_direct_neutralization: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Acknowledge that target-visible minimal neutralization is not valid "
+                "production data"
+            )
+        ),
+    ] = False,
 ) -> None:
-    """Generate resumable neutral-to-styled pairs with the OpenAI Responses API."""
+    """Run the deprecated target-visible neutralizer only for reproducibility."""
+    if not allow_legacy_direct_neutralization:
+        raise typer.BadParameter(
+            "Direct neutralization leaks target wording and produced an identity-heavy corpus. "
+            "Use prepare-style-targets followed by generate-convergence-pilot, or explicitly pass "
+            "--allow-legacy-direct-neutralization only to reproduce an old experiment."
+        )
     load_dotenv()
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -898,6 +1054,19 @@ def privacy_audit_command(
     _emit(report)
     if not report["passed"]:
         raise typer.Exit(code=1)
+
+
+@app.command("export-messages-csv")
+def export_messages_csv_command(
+    messages: Annotated[Path, typer.Option(help="Extracted message JSONL")] = Path(
+        "work/extracted/messages.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Private spreadsheet-friendly CSV")] = Path(
+        "work/extracted/messages.csv"
+    ),
+) -> None:
+    """Export one message per CSV row with a readable local timestamp."""
+    _emit(export_messages_csv(resolve_path(messages), resolve_path(output)))
 
 
 @app.command("corpus-stats")

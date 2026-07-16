@@ -7,9 +7,13 @@ from imessage_mlx.utils import write_jsonl
 def _record(text: str) -> dict:
     return {
         "message_id": "a" * 24,
+        "reply_to_message_id": None,
+        "thread_root_message_id": None,
+        "thread_originator_part": None,
         "chat_id": "b" * 24,
         "timestamp_ns": 1,
         "sender_role": "other",
+        "sender_name": "Alice Example",
         "participant_id": "c" * 24,
         "text": text,
         "has_attachment": False,
@@ -23,6 +27,7 @@ def test_privacy_audit_reports_only_aggregate_failures(tmp_path: Path) -> None:
     write_jsonl(clean, [_record("hello <|email|>")])
     clean_report = audit_extracted_messages(clean, tmp_path / "clean-report.json")
     assert clean_report["passed"]
+    assert clean_report["contact_names_persisted"]
     assert "hello" not in (tmp_path / "clean-report.json").read_text(encoding="utf-8")
 
     unsafe = tmp_path / "unsafe.jsonl"

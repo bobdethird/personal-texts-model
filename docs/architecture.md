@@ -98,18 +98,31 @@ environment. Training uses deterministic seeds, small batches, gradient accumula
 best-adapter saves, and early stopping. BART applies an exact 256-token source/target guard before
 training; MLX-LM receives the same maximum sequence length. Adapters are neither fused nor uploaded.
 
-Multi-register convergence is a separate v1 data contract layered onto the accepted BART splits.
-Targets are selected deterministically within their existing train/validation/test assignment.
-OpenAI Stage A extracts typed semantics from the target; a separate Stage B request receives only
-the semantic object and emits exactly four labeled sources. The manifest fingerprints the input
-files, model, prompts, schemas, and style set. Semantics and variants checkpoint independently, while
-only complete target groups are published.
+Multi-register convergence is a versioned data contract layered onto chronological style targets.
+Before splitting, a local temporal BM25 index searches only messages older than each target across
+all chats. A context bundle separates explicit links, recent turns, retrieved historical evidence,
+and human-approved glossary definitions. OpenAI Stage A extracts typed semantics, must cite bundle
+evidence for resolved entities, records every slang or filler reading with a widespread/in-group/
+uncertain scope (in-group readings require cited evidence and uncertain expressions stay verbatim as
+protected literals), and emits a reworded fully resolved one-sentence paraphrase that is
+rejected when it near-duplicates the target; a separate Stage B request receives only the semantic
+object and emits exactly four labeled sources. Local scoring compares each source against that
+paraphrase (or the target when it scores higher), so context-dependent targets are judged against
+their resolved meaning. Glossary proposals are mined case-insensitively from corpus-rare terms
+rather than capitalization. The manifest fingerprints input files, selected context,
+retrieval/glossary fingerprints, model, prompts, schemas, and style set. Semantics and variants
+checkpoint independently, while only complete target groups are published.
 
-Each generated row carries `target_id`, `source_pair_id`, `variant_kind`, and `split`. Adapter
+Each generated row carries `target_id`, `source_pair_id`, `variant_kind`, `split`, and one generation
+fingerprint. Adapter
 deduplication treats repeated targets from the same owner group as intentional but rejects matches
 owned by another group or split. Local sentence-transformer scoring runs before dataset assembly.
 The pilot uses all four rows and reports effective target exposure; larger runs must reconsider a
 group-aware rotating sampler if memorization rises.
+
+Retrieval is a pair-generation aid, not an adapter input. Live rewriting remains draft-only; the
+upstream assistant is responsible for using conversation and project knowledge to create a
+semantically correct draft before style transformation.
 
 Model selection is task-specific. Reply selection retains its original one-million-token hard
 minimum and ten-token-per-parameter heuristic. Rewrite selection considers only the training split,

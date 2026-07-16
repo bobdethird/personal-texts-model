@@ -40,10 +40,21 @@ def test_pair_generation_requires_api_key(monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr("imessage_mlx.cli.load_dotenv", lambda: None)
 
-    result = CliRunner().invoke(app, ["generate-rewrite-pairs"])
+    result = CliRunner().invoke(
+        app,
+        ["generate-rewrite-pairs", "--allow-legacy-direct-neutralization"],
+    )
 
     assert result.exit_code != 0
     assert "OPENAI_API_KEY" in result.output
+
+
+def test_legacy_direct_pair_generation_is_blocked_by_default() -> None:
+    result = CliRunner().invoke(app, ["generate-rewrite-pairs"])
+
+    assert result.exit_code != 0
+    assert "identity-heavy corpus" in result.output
+    assert "prepare-style-targets" in result.output
 
 
 def test_rewrite_train_uses_task_specific_selection_report(tmp_path: Path, monkeypatch) -> None:

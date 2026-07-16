@@ -45,6 +45,8 @@ Read [the privacy documentation](docs/privacy.md) before running the data pipeli
 - Processing happens from a consistent private backup under `work/`, never from the live database.
 - Attachments are never opened or copied.
 - Handles and chat identifiers are replaced with keyed HMAC pseudonyms before JSONL is written.
+- With `include_contact_names: true`, sender display names from macOS Contacts are retained while
+  raw phone numbers and email handles remain omitted.
 - URLs, email addresses, and phone-number-shaped strings are redacted by default.
 - Raw messages are never printed in normal logs.
 - Datasets, tokenizers, checkpoints, and final weights are excluded from Git.
@@ -137,19 +139,23 @@ schema instead of assuming an internet example is correct.
 ```bash
 uv run imessage-mlx prepare --config configs/data.yaml
 uv run imessage-mlx privacy-audit
+uv run imessage-mlx export-messages-csv
 ```
 
 This stage:
 
 1. Recovers ordinary text and Apple typedstream `attributedBody` text.
 2. Filters reactions, system events, deleted messages, and attachment-only rows.
-3. Redacts obvious identifiers and pseudonymizes database identities.
+3. Redacts obvious identifiers, pseudonymizes database identities, and—when configured—adds local
+   Contacts display names without persisting raw handles.
 4. Groups messages into six-hour conversation sessions.
 5. Removes duplicate sessions.
 6. Creates chronological 90/5/5 splits with seven-day guard bands.
 7. Verifies that no duplicate session hash appears across splits.
 
 The command stops instead of silently continuing when recovery or privacy checks fail.
+The optional CSV export writes the same private message rows to
+`work/extracted/messages.csv` with a readable local timestamp for spreadsheet browsing.
 
 ### 4. Train the tokenizer
 
@@ -258,16 +264,18 @@ uv run imessage-mlx chat \
 
 ## Experimental casual rewrite mode
 
-Rewrite mode trains a separate model to transform a neutral draft into the owner's casual texting
-style. Prepare private JSONL where the neutral version is the input and the original user-authored
-message is the target:
+Rewrite mode trains a separate model to transform an upstream model's draft into the owner's casual
+texting style. The original user-authored message is always the target. Production inputs must be
+generated without exposing that target wording:
 
 ```json
 {"pair_id":"p1","timestamp_ns":1000000000,"neutral_text":"I will be there at seven.","styled_text":"ill be there at 7"}
 ```
 
-Never reverse these fields. `styled_text` is the text whose style the model learns. Pair files,
-splits, token arrays, tokenizers, and model artifacts stay under the ignored private directories.
+Never reverse these fields. `styled_text` is the text whose style the model learns. Do not create
+`neutral_text` by asking a model for the smallest edit of `styled_text`: that leaks target wording,
+creates identity-heavy pairs, and does not match real upstream drafts. Pair files, splits, token
+arrays, tokenizers, and model artifacts stay under the ignored private directories.
 
 ### Recommended local pretrained-adapter path
 
@@ -293,25 +301,37 @@ surface-only training examples to one quarter of the substantive stratum each. T
 identity examples from dominating without inflating any unique-data report. The BART worker applies
 a final 256-token source/target check and reports every skipped outlier.
 
-The completed local run trained on 32,812 accepted pairs for about 4.1 hours and reached 0.922
-validation loss. On 1,589 held-out pairs it preserved protected facts in 99.18% of outputs, reached
-0.953 mean local semantic similarity, closed 85.4% of the measured style-marker gap and 55.4% of the
-target lexical-change gap, and produced no empty, repeated, or malformed outputs. These figures are
-specific to this private corpus; the review requirement still applies.
+The earlier 32,812-pair BART run is retained only as an architecture and rollback experiment. Its
+direct-neutralization corpus was too close to the targets, so its held-out metrics do not establish
+production rewrite quality. Retrain every candidate on the blind-generated dataset below.
 
 ### Multi-register convergence pilot
 
-The convergence pipeline teaches several English formulations of one meaning to map to the same
-user-written target. Stage A sends the accepted target to OpenAI for structured semantic extraction.
-Stage B is a separate request that receives only that semantic JSON and generates formal,
-everyday-neutral, verbose-indirect, and terse-conversational sources. Both requests use
-`store=False`; Stage B never receives the original wording.
+The blind pair pipeline teaches several English formulations of one meaning to map to the same
+user-written target. Each original outgoing bubble is one target; adjacent bubbles remain separate
+because they may express different intents. Context construction prioritizes explicit replies and
+recent turns, then performs temporal BM25 retrieval locally across all earlier chats for distinctive
+terms. Human-approved glossary entries can ground recurring project names. Only the selected,
+redacted evidence is sent with the target to Stage A; the complete history remains local. Stage A
+must cite evidence for resolved entities and emit a fully resolved one-sentence paraphrase in fresh
+wording; that paraphrase anchors both Stage B and local semantic scoring. Slang and texting fillers
+are interpreted explicitly and scoped as widespread, in-group (evidence required), or uncertain
+(kept verbatim), so wrong readings are visible and reviewable rather than silent. Stage B receives only that
+semantic JSON and generates formal, everyday-neutral, verbose-indirect, and terse-conversational
+sources. Both requests use `store=False`; Stage B never receives the original wording. Time-based target merging is available
+only through the explicit nonzero `--merge-gap-minutes` experiment.
 
 Run a small pilot before scaling. The example below selects 40 training targets, five validation
 targets, and five untouched test targets. Prompt/model/input fingerprints make interrupted runs
 resumable and prevent incompatible artifacts from being mixed.
 
 ```bash
+uv run imessage-mlx propose-entity-glossary
+uv run imessage-mlx review-entity-glossary
+# Edit the private glossary JSON; approve only evidence-supported definitions.
+
+uv run imessage-mlx prepare-style-targets
+
 uv run imessage-mlx generate-convergence-pilot \
   --model gpt-5.6-luna \
   --train-targets 40 \
@@ -321,12 +341,21 @@ uv run imessage-mlx generate-convergence-pilot \
 
 uv run imessage-mlx validate-convergence-data-semantics \
   --environment work/envs/bart \
-  --pairs work/rewrite/convergence/pilot-50/published.jsonl \
-  --output work/rewrite/convergence/pilot-50/semantic-validated.jsonl
+  --pairs work/rewrite/convergence/pilot-50/semantic-evaluation-inputs.jsonl \
+  --output work/rewrite/convergence/pilot-50/semantic-validated.jsonl \
+  --minimum-similarity 0.70
+
+uv run imessage-mlx review-convergence-pairs \
+  --pairs work/rewrite/convergence/pilot-50/semantic-validated.jsonl \
+  --output work/rewrite/convergence/reviews/pair-pilot.md \
+  --summary work/rewrite/convergence/reviews/pair-pilot-summary.json
 
 uv run imessage-mlx prepare-convergence-adapters \
   --pairs work/rewrite/convergence/pilot-50/semantic-validated.jsonl \
-  --output work/rewrite/convergence/adapters-50
+  --output work/rewrite/convergence/adapters-50 \
+  --review-summary work/rewrite/convergence/reviews/pair-pilot-summary.json \
+  --minimum-similarity 0.70 \
+  --minimum-group-mean 0.80
 
 uv run imessage-mlx train-adapter \
   --config configs/adapter-bart-base.yaml \
@@ -335,49 +364,55 @@ uv run imessage-mlx train-adapter \
   --output outputs/adapters/bart-convergence-50
 ```
 
-Preparation publishes only complete four-source target groups. It checks protected facts, local
-semantic similarity, sibling diversity, target lineage, and cross-split leakage. Evaluation runs the
-current and pilot adapters on the same challenge file, reports each register separately, measures
-copying and within-target convergence, and produces a private 50-group review. Pilot artifacts never
-replace the promoted adapter automatically.
+Preparation publishes only complete four-source target groups and excludes the old
+direct-neutralization corpus by default. It checks protected facts, local semantic similarity,
+sibling diversity, target lineage, and cross-split leakage. Evaluation runs candidates on the same
+challenge file, reports each register separately, measures copying and within-target convergence,
+and produces a private grouped review. Pilot artifacts never replace the promoted adapter
+automatically. Complete the generated pair-review checklist and summary before scaling. Do not
+promote the 50-target pilot. After it passes human review, generate a separately fingerprinted full
+allocation, validate it, and prepare it as
+`work/rewrite/convergence/adapters-full`.
 
 ```bash
-uv run imessage-mlx prepare-adapters
 uv run imessage-mlx setup-adapter-environment bart --output work/envs/bart
-uv run imessage-mlx setup-adapter-environment qwen --output work/envs/mlx-lm
 
 uv run imessage-mlx train-adapter \
   --config configs/adapter-bart-base.yaml \
   --environment work/envs/bart \
-  --output outputs/adapters/bart-base-full
+  --data work/rewrite/convergence/adapters-full \
+  --output outputs/adapters/bart-blind
 
 uv run imessage-mlx predict-adapter \
   --config configs/adapter-bart-base.yaml \
   --environment work/envs/bart \
-  --adapter outputs/adapters/bart-base-full \
-  --output work/rewrite/evaluation/bart-full.jsonl
+  --data work/rewrite/convergence/adapters-full \
+  --adapter outputs/adapters/bart-blind \
+  --test-file work/rewrite/convergence/adapters-full/bart/challenge-test.jsonl \
+  --output work/rewrite/convergence/evaluation/bart-blind.jsonl
 
 uv run imessage-mlx evaluate-rewrite-semantics \
-  --predictions work/rewrite/evaluation/bart-full.jsonl \
+  --predictions work/rewrite/convergence/evaluation/bart-blind.jsonl \
   --environment work/envs/bart \
-  --output work/rewrite/evaluation/bart-full-semantic.json
+  --output work/rewrite/convergence/evaluation/bart-blind-semantic.json
 
-uv run imessage-mlx evaluate-rewrite-adapter \
-  --predictions work/rewrite/evaluation/bart-full.jsonl \
-  --semantic-report work/rewrite/evaluation/bart-full-semantic.json \
-  --output work/rewrite/evaluation/bart-full-report.json
+uv run imessage-mlx evaluate-convergence-adapter \
+  --predictions work/rewrite/convergence/evaluation/bart-blind.jsonl \
+  --train work/rewrite/convergence/adapters-full/bart/train.jsonl \
+  --semantic-report work/rewrite/convergence/evaluation/bart-blind-semantic.json \
+  --output work/rewrite/convergence/evaluation/bart-blind-report.json
 
-uv run imessage-mlx predict-legacy-rewrite \
-  --test work/rewrite/adapters/bart/test.jsonl \
-  --output work/rewrite/evaluation/legacy-291k.jsonl
-
-uv run imessage-mlx review-rewrite-models \
-  --adapter work/rewrite/evaluation/bart-full.jsonl \
-  --legacy work/rewrite/evaluation/legacy-291k.jsonl
+# Compare two candidates on this exact challenge, review the generated private Markdown,
+# then accurately complete its .summary.json attestation before promotion.
+uv run imessage-mlx review-convergence-models \
+  --baseline work/rewrite/convergence/evaluation/candidate-a.jsonl \
+  --augmented work/rewrite/convergence/evaluation/bart-blind.jsonl \
+  --output work/rewrite/convergence/reviews/model-comparison.md
 
 uv run imessage-mlx promote-adapter \
-  --adapter outputs/adapters/bart-base-full \
-  --evaluation work/rewrite/evaluation/bart-full-report.json
+  --adapter outputs/adapters/bart-blind \
+  --evaluation work/rewrite/convergence/evaluation/bart-blind-report.json \
+  --review-summary work/rewrite/convergence/reviews/model-comparison.summary.json
 
 uv run imessage-mlx rewrite-adapter "I will be there at seven."
 ```
@@ -403,13 +438,13 @@ uv run imessage-mlx setup-adapter-environment flan_t5 --output work/envs/seq2seq
 uv run imessage-mlx train-adapter \
   --config configs/adapter-flan-t5-small.yaml \
   --environment work/envs/seq2seq \
-  --data work/rewrite/adapters \
+  --data work/rewrite/convergence/adapters-full \
   --output outputs/adapters/flan-t5-small
 
 uv run imessage-mlx train-adapter \
   --config configs/adapter-opus-mt-gem-gem.yaml \
   --environment work/envs/seq2seq \
-  --data work/rewrite/adapters \
+  --data work/rewrite/convergence/adapters-full \
   --output outputs/adapters/opus-mt-gem-gem
 ```
 
@@ -451,11 +486,11 @@ previous promoted artifact is moved to a timestamped rollback directory. Review 
 message and complete the private comparison checklist before replacing the baseline; no command
 sends messages automatically.
 
-Pairs can be supplied manually or generated from recent outgoing messages with OpenAI. The original
-neutral-pair generator sends redacted message text. The convergence generator sends the complete
-accepted `styled_text` to Stage A because that is the authorized source of meaning; Stage B sees only
-semantic JSON. Review the provider policy before running either command. Message content is never
-printed or written to aggregate reports. Put the credential in the ignored `.env` file:
+The deprecated `generate-rewrite-pairs` command is blocked unless its explicit legacy override is
+passed; do not use its output for production training. The blind generator sends the complete target
+and its redacted conversation context to Stage A because they are the authorized source of meaning;
+Stage B sees only semantic JSON. Review the provider policy before running it. Message content is
+never printed or written to aggregate reports. Put the credential in the ignored `.env` file:
 
 ```text
 OPENAI_API_KEY=your_key_here

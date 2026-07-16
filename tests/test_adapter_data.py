@@ -1,13 +1,16 @@
 import json
 from pathlib import Path
 
+import pytest
+
+from imessage_mlx.adapter_worker import _semantic_reference
 from imessage_mlx.data.adapters import (
     classify_pair_signal,
     prepare_adapter_datasets,
     prepare_convergence_adapter_datasets,
     protected_facts,
 )
-from imessage_mlx.utils import read_jsonl, write_jsonl
+from imessage_mlx.utils import read_jsonl, write_json, write_jsonl
 
 
 def _pair(pair_id: str, timestamp: int, neutral: str, styled: str) -> dict[str, object]:
@@ -28,6 +31,34 @@ def test_pair_signal_strata_and_protected_facts() -> None:
         "placeholders": ("<|url|>",),
         "negated": True,
     }
+    assert protected_facts("Don’t mess this up")["negated"] is True
+
+
+def test_context_resolved_semantic_reference_is_used_when_available() -> None:
+    row = {
+        "target": "yeah that works",
+        "semantic": {
+            "speech_act": "agreement",
+            "atomic_propositions": ["The proposed dinner time is acceptable."],
+            "entities": [],
+            "protected_literals": [],
+            "time_references": ["the proposed dinner time"],
+            "numbers": [],
+            "modality_uncertainty": [],
+            "question_intent": None,
+            "emotion": "positive",
+            "intensity": "normal",
+        },
+    }
+
+    reference = _semantic_reference(row)
+
+    assert "agreement" in reference
+    assert "dinner time is acceptable" in reference
+    assert _semantic_reference({"target": "fallback"}) == "fallback"
+
+    row["semantic"]["resolved_paraphrase"] = "The proposed dinner time works for me."
+    assert _semantic_reference(row) == "The proposed dinner time works for me."
 
 
 def test_prepare_adapter_datasets_removes_cross_split_normalized_leakage(
@@ -95,7 +126,9 @@ def test_prepare_adapter_datasets_removes_cross_split_normalized_leakage(
     assert json.loads((tmp_path / "report.json").read_text())["schema_version"] == 1
 
 
-def test_prepare_convergence_data_keeps_same_target_group_and_lineage(tmp_path: Path) -> None:
+def test_prepare_convergence_data_uses_only_blind_generated_groups_by_default(
+    tmp_path: Path,
+) -> None:
     base = tmp_path / "base"
     for split in ("train", "valid", "test"):
         write_jsonl(
@@ -146,9 +179,68 @@ def test_prepare_convergence_data_keeps_same_target_group_and_lineage(tmp_path: 
     assert {row["target"] for row in challenge_valid} == {"my valid target"}
     assert report["accepted_target_groups"] == {"train": 1, "valid": 1, "test": 1}
     train = list(read_jsonl(tmp_path / "prepared/bart/train.jsonl"))
-    assert len(train) == 5
-    assert train[0]["target_id"] == "train-target"
-    assert train[0]["variant_kind"] == "original_neutral"
+    assert len(train) == 4
+    assert {row["target_id"] for row in train} == {"train-target"}
+    assert {row["variant_kind"] for row in train} == set(styles)
+    assert report["legacy_base_included"] is False
+    assert report["training_mode"] == "blind_generated_only"
+    assert report["base_rows"] == {"train": 0, "valid": 0, "test": 0}
+
+
+def test_context_grounded_adapter_data_requires_completed_review(tmp_path: Path) -> None:
+    styles = (
+        "formal_professional",
+        "neutral_everyday",
+        "verbose_indirect",
+        "terse_conversational",
+    )
+    generated = [
+        {
+            "pair_id": f"{split}-{index}",
+            "target_id": f"{split}-target",
+            "source_pair_id": f"{split}-source",
+            "split": split,
+            "variant_kind": style,
+            "source": f"{style} wording for {split}",
+            "target": f"target wording for {split}",
+            "semantic_similarity": 0.95,
+            "generation_fingerprint": "fingerprint",
+            "grounding_stratum": "historical",
+            "context_bundle": {"retrieved_evidence": [{"message_id": "evidence"}]},
+        }
+        for split in ("train", "valid", "test")
+        for index, style in enumerate(styles)
+    ]
+    pairs = tmp_path / "grounded.jsonl"
+    write_jsonl(pairs, generated)
+
+    with pytest.raises(ValueError, match="human review"):
+        prepare_convergence_adapter_datasets(
+            None,
+            pairs,
+            tmp_path / "rejected",
+            tmp_path / "rejected-report.json",
+        )
+
+    summary = tmp_path / "review-summary.json"
+    write_json(
+        summary,
+        {
+            "human_approved": True,
+            "reviewed_target_groups": 3,
+            "semantic_or_fact_failures": 0,
+            "generation_fingerprints": ["fingerprint"],
+        },
+    )
+    report = prepare_convergence_adapter_datasets(
+        None,
+        pairs,
+        tmp_path / "accepted",
+        tmp_path / "accepted-report.json",
+        review_summary_path=summary,
+    )
+    assert report["generation_fingerprint"] == "fingerprint"
+    assert report["human_review_required"] is True
 
 
 def test_prepare_convergence_data_rejects_cross_group_source_leakage(tmp_path: Path) -> None:
@@ -206,6 +298,7 @@ def test_prepare_convergence_data_rejects_cross_group_source_leakage(tmp_path: P
         path,
         tmp_path / "prepared",
         tmp_path / "report.json",
+        include_legacy_base=True,
     )
 
     assert report["removed_target_groups"]["cross_split_normalized"] == 1

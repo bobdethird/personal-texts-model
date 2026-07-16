@@ -73,12 +73,29 @@ an old 4,096-token tokenizer or edit the selection report to bypass a failed gat
 ## OpenAI pair generation fails
 
 Put `OPENAI_API_KEY` and optionally `OPENAI_MODEL` in the ignored project-root `.env` file. The
-generator retries transient API and rate-limit failures, writes each successful structured batch
-immediately, and can be rerun without paying to regenerate completed pair identifiers. Its report
-contains aggregate error types and token usage, never message text.
+blind generator retries transient API and rate-limit failures, writes each successful structured
+stage immediately, and can be rerun without paying to regenerate completed target identifiers. Its
+report contains aggregate error types and token usage, never message text. Run
+`prepare-style-targets` before `generate-convergence-pilot`.
+
+`generate-rewrite-pairs` is intentionally blocked by default. Its target-visible, minimal-edit
+neutralization produced an identity-heavy corpus and is retained only to reproduce old experiments.
 
 An unknown model error means the configured model ID is unavailable to the account. Set
 `OPENAI_MODEL` to an accessible Responses API model and rerun the same command.
+
+## A project name, slang term, or conversational reference is interpreted incorrectly
+
+Run `propose-entity-glossary`, inspect `review-entity-glossary`, and approve only definitions
+supported by the cited private messages. Rebuild style targets afterward. The generated pair review
+shows exact replies, recent turns, historical retrieval, glossary definitions, extracted
+propositions, and every slang reading with its widespread/in-group/uncertain scope. Reject any group
+whose interpretation is not supported there. Widespread texting slang, including short abbreviations
+such as "ts" and generic address terms such as "brodie", is canonicalized directly. In-group readings
+are usually proper nouns or coined names for the author's projects, people, and personal topics, and
+can only be resolved through an approved glossary entry or retrieved message evidence; otherwise the
+extractor must mark them uncertain and keep them verbatim. Do not solve ambiguity by approving a guessed
+glossary definition or allowing future messages into retrieval.
 
 ## A rewrite pair exceeds the context window
 

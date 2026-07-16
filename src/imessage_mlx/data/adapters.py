@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from collections import Counter, defaultdict
@@ -44,10 +45,11 @@ def classify_pair_signal(neutral_text: str, styled_text: str) -> str:
 
 
 def protected_facts(text: str) -> dict[str, object]:
+    normalized = text.replace("’", "'").replace("‘", "'")
     return {
-        "numbers": tuple(NUMBER_RE.findall(text)),
-        "placeholders": tuple(PLACEHOLDER_RE.findall(text)),
-        "negated": bool(NEGATION_RE.search(text)),
+        "numbers": tuple(NUMBER_RE.findall(normalized)),
+        "placeholders": tuple(PLACEHOLDER_RE.findall(normalized)),
+        "negated": bool(NEGATION_RE.search(normalized)),
     }
 
 
@@ -329,34 +331,79 @@ def _validated_convergence_record(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def prepare_convergence_adapter_datasets(
-    base_bart_dir: str | Path,
+    base_bart_dir: str | Path | None,
     convergence_pairs_path: str | Path,
     output_dir: str | Path,
     report_path: str | Path,
     *,
-    minimum_semantic_similarity: float = 0.25,
-    minimum_group_mean_similarity: float = 0.50,
+    minimum_semantic_similarity: float = 0.70,
+    minimum_group_mean_similarity: float = 0.80,
     require_semantic_validation: bool = True,
+    include_legacy_base: bool = False,
+    review_summary_path: str | Path | None = None,
 ) -> dict[str, Any]:
     if not -1 <= minimum_semantic_similarity <= 1:
         raise ValueError("Minimum convergence semantic similarity must be between -1 and 1")
     if not -1 <= minimum_group_mean_similarity <= 1:
         raise ValueError("Minimum convergence group mean similarity must be between -1 and 1")
 
-    base_root = Path(base_bart_dir)
     output = Path(output_dir)
-    base = {
-        split: [
-            _validated_bart_record(record, artifact=f"Base BART {split}")
-            for record in read_jsonl(base_root / f"{split}.jsonl")
-        ]
-        for split in ("train", "valid", "test")
+    base: dict[str, list[dict[str, str]]] = {
+        "train": [],
+        "valid": [],
+        "test": [],
     }
+    if include_legacy_base:
+        if base_bart_dir is None:
+            raise ValueError("Legacy augmentation requires a base BART data directory")
+        base_root = Path(base_bart_dir)
+        base = {
+            split: [
+                _validated_bart_record(record, artifact=f"Base BART {split}")
+                for record in read_jsonl(base_root / f"{split}.jsonl")
+            ]
+            for split in ("train", "valid", "test")
+        }
     convergence = [
         _validated_convergence_record(record) for record in read_jsonl(convergence_pairs_path)
     ]
     if not convergence:
         raise ValueError("Convergence adapter preparation requires generated pairs")
+    fingerprints = {
+        str(record["generation_fingerprint"])
+        for record in convergence
+        if isinstance(record.get("generation_fingerprint"), str)
+        and str(record["generation_fingerprint"]).strip()
+    }
+    fingerprinted_rows = sum(
+        isinstance(record.get("generation_fingerprint"), str)
+        and bool(str(record["generation_fingerprint"]).strip())
+        for record in convergence
+    )
+    if fingerprints and (len(fingerprints) != 1 or fingerprinted_rows != len(convergence)):
+        raise ValueError("Convergence rows must share one complete generation fingerprint")
+    context_grounded = any(
+        record.get("grounding_stratum") in {"reply", "historical", "glossary"}
+        or isinstance(record.get("context_bundle"), dict)
+        for record in convergence
+    )
+    review_summary: dict[str, Any] | None = None
+    if context_grounded:
+        required_review_groups = len({str(record["target_id"]) for record in convergence})
+        if review_summary_path is None:
+            raise ValueError("Context-grounded convergence data requires a human review summary")
+        review_summary = json.loads(Path(review_summary_path).read_text(encoding="utf-8"))
+        if (
+            not isinstance(review_summary, dict)
+            or review_summary.get("human_approved") is not True
+            or int(review_summary.get("reviewed_target_groups", 0)) < required_review_groups
+            or review_summary.get("semantic_or_fact_failures") != 0
+            or (
+                fingerprints
+                and set(review_summary.get("generation_fingerprints", [])) != fingerprints
+            )
+        ):
+            raise ValueError("Context-grounded convergence review is incomplete or has failures")
 
     source_pair_owners: dict[tuple[str, str], str] = {}
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -420,10 +467,11 @@ def prepare_convergence_adapter_datasets(
         if split == "train"
     }
     seen = _NearDuplicateIndex()
-    for record in base["train"]:
-        owner = owner_by_base_pair.get(record["pair_id"], f"base:{record['pair_id']}")
-        seen.add(record["source"], owner=owner)
-        seen.add(record["target"], owner=owner)
+    if include_legacy_base:
+        for record in base["train"]:
+            owner = owner_by_base_pair.get(record["pair_id"], f"base:{record['pair_id']}")
+            seen.add(record["source"], owner=owner)
+            seen.add(record["target"], owner=owner)
 
     accepted_by_split: dict[str, list[dict[str, Any]]] = {
         "train": [],
@@ -432,15 +480,11 @@ def prepare_convergence_adapter_datasets(
     }
     for split in ("train", "valid", "test"):
         for target_id in sorted(
-            target_id
-            for target_id in accepted_groups
-            if group_splits[target_id] == split
+            target_id for target_id in accepted_groups if group_splits[target_id] == split
         ):
             records = sorted(
                 accepted_groups[target_id],
-                key=lambda record: CONVERGENCE_VARIANT_KINDS.index(
-                    str(record["variant_kind"])
-                ),
+                key=lambda record: CONVERGENCE_VARIANT_KINDS.index(str(record["variant_kind"])),
             )
             leakage = None
             for record in records:
@@ -464,10 +508,10 @@ def prepare_convergence_adapter_datasets(
             raise ValueError(f"No convergence {split} groups passed leakage and quality gates")
 
     def with_lineage(record: dict[str, str]) -> dict[str, str]:
-        owner = source_pair_owners.get(
-            ("train", record["pair_id"])
-        ) or source_pair_owners.get(("valid", record["pair_id"])) or source_pair_owners.get(
-            ("test", record["pair_id"])
+        owner = (
+            source_pair_owners.get(("train", record["pair_id"]))
+            or source_pair_owners.get(("valid", record["pair_id"]))
+            or source_pair_owners.get(("test", record["pair_id"]))
         )
         if owner is None:
             return record
@@ -477,31 +521,85 @@ def prepare_convergence_adapter_datasets(
             "variant_kind": "original_neutral",
         }
 
-    augmented_train = [with_lineage(record) for record in base["train"]] + [
+    generated_train = [
         {
             key: str(record[key])
-            for key in ("pair_id", "source", "target", "target_id", "variant_kind")
+            for key in (
+                "pair_id",
+                "source",
+                "target",
+                "target_id",
+                "variant_kind",
+                "generation_fingerprint",
+            )
+            if key in record
         }
         for record in accepted_by_split["train"]
     ]
-    augmented_valid = [with_lineage(record) for record in base["valid"]] + [
+    generated_valid = [
         {
             key: str(record[key])
-            for key in ("pair_id", "source", "target", "target_id", "variant_kind")
+            for key in (
+                "pair_id",
+                "source",
+                "target",
+                "target_id",
+                "variant_kind",
+                "generation_fingerprint",
+            )
+            if key in record
         }
         for record in accepted_by_split["valid"]
     ]
+    generated_test = [
+        {
+            key: str(record[key])
+            for key in (
+                "pair_id",
+                "source",
+                "target",
+                "target_id",
+                "variant_kind",
+                "generation_fingerprint",
+            )
+            if key in record
+        }
+        for record in accepted_by_split["test"]
+    ]
+    train = (
+        [with_lineage(record) for record in base["train"]] + generated_train
+        if include_legacy_base
+        else generated_train
+    )
+    valid = (
+        [with_lineage(record) for record in base["valid"]] + generated_valid
+        if include_legacy_base
+        else generated_valid
+    )
+    test = (
+        [with_lineage(record) for record in base["test"]] + generated_test
+        if include_legacy_base
+        else generated_test
+    )
     bart_output = output / "bart"
-    write_jsonl(bart_output / "train.jsonl", augmented_train)
-    write_jsonl(bart_output / "valid.jsonl", augmented_valid)
-    write_jsonl(bart_output / "test.jsonl", base["test"])
+    write_jsonl(bart_output / "train.jsonl", train)
+    write_jsonl(bart_output / "valid.jsonl", valid)
+    write_jsonl(bart_output / "test.jsonl", test)
     for split in ("train", "valid", "test"):
         write_jsonl(
             bart_output / f"challenge-{split}.jsonl",
             (
                 {
                     key: str(record[key])
-                    for key in ("pair_id", "source", "target", "target_id", "variant_kind")
+                    for key in (
+                        "pair_id",
+                        "source",
+                        "target",
+                        "target_id",
+                        "variant_kind",
+                        "generation_fingerprint",
+                    )
+                    if key in record
                 }
                 for record in accepted_by_split[split]
             ),
@@ -517,7 +615,21 @@ def prepare_convergence_adapter_datasets(
         "minimum_semantic_similarity": minimum_semantic_similarity,
         "minimum_group_mean_similarity": minimum_group_mean_similarity,
         "semantic_validation_required": require_semantic_validation,
+        "training_mode": (
+            "generated_plus_legacy_base" if include_legacy_base else "blind_generated_only"
+        ),
+        "legacy_base_included": include_legacy_base,
+        "generation_fingerprint": next(iter(fingerprints), None),
+        "human_review_required": context_grounded,
+        "human_review_summary": (
+            str(Path(review_summary_path)) if review_summary_path is not None else None
+        ),
         "base_rows": {split: len(rows) for split, rows in base.items()},
+        "model_rows": {
+            "train": len(train),
+            "valid": len(valid),
+            "test": len(test),
+        },
         "input_generated_rows": len(convergence),
         "input_target_groups": len(groups),
         "accepted_target_groups": accepted_group_counts,

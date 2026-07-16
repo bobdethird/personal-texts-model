@@ -462,12 +462,51 @@ def semantic_evaluation(
     return report
 
 
+def _semantic_reference(row: dict[str, Any]) -> str:
+    semantic = row.get("semantic")
+    if not isinstance(semantic, dict):
+        return str(row["target"])
+    paraphrase = semantic.get("resolved_paraphrase")
+    if isinstance(paraphrase, str) and paraphrase.strip():
+        return paraphrase.strip()
+    values: list[str] = []
+    for key in (
+        "speech_act",
+        "atomic_propositions",
+        "entities",
+        "protected_literals",
+        "time_references",
+        "numbers",
+        "modality_uncertainty",
+        "question_intent",
+        "emotion",
+        "intensity",
+        "remaining_ambiguities",
+    ):
+        value = semantic.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+        elif isinstance(value, list):
+            values.extend(str(item).strip() for item in value if str(item).strip())
+    for entity in semantic.get("resolved_entities", []):
+        if isinstance(entity, dict):
+            values.extend(
+                str(entity.get(key, "")).strip()
+                for key in ("term", "interpretation")
+                if str(entity.get(key, "")).strip()
+            )
+    for slang in semantic.get("slang_interpretations", []):
+        if isinstance(slang, dict) and str(slang.get("interpretation", "")).strip():
+            values.append(str(slang["interpretation"]).strip())
+    return " ".join(values) or str(row["target"])
+
+
 def convergence_source_semantics(
     data_path: str | Path,
     output_path: str | Path,
     report_path: str | Path,
     *,
-    minimum_similarity: float = 0.25,
+    minimum_similarity: float = 0.70,
     model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
     model_revision: str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
 ) -> dict[str, Any]:
@@ -496,7 +535,13 @@ def convergence_source_semantics(
         [str(row["target"]) for row in rows],
         normalize_embeddings=True,
     )
-    similarities = np.sum(source_embeddings * target_embeddings, axis=1)
+    semantic_embeddings = model.encode(
+        [_semantic_reference(row) for row in rows],
+        normalize_embeddings=True,
+    )
+    target_similarities = np.sum(source_embeddings * target_embeddings, axis=1)
+    semantic_similarities = np.sum(source_embeddings * semantic_embeddings, axis=1)
+    similarities = np.maximum(target_similarities, semantic_similarities)
     validated = [
         {**row, "semantic_similarity": float(score)}
         for row, score in zip(rows, similarities, strict=True)
@@ -510,7 +555,10 @@ def convergence_source_semantics(
         "device": device,
         "examples": len(rows),
         "minimum_required_similarity": minimum_similarity,
+        "reference_policy": "maximum_of_original_target_and_context_resolved_semantics",
         "mean_similarity": float(similarities.mean()),
+        "mean_target_similarity": float(target_similarities.mean()),
+        "mean_context_resolved_semantic_similarity": float(semantic_similarities.mean()),
         "minimum_similarity": float(similarities.min()),
         "below_minimum": int((similarities < minimum_similarity).sum()),
         "accepted_rows": int((similarities >= minimum_similarity).sum()),
@@ -603,7 +651,7 @@ def main() -> None:
             subparser.add_argument("--data", required=True)
             if command == "convergence-data-semantics":
                 subparser.add_argument("--report", required=True)
-                subparser.add_argument("--minimum", type=float, default=0.25)
+                subparser.add_argument("--minimum", type=float, default=0.70)
             continue
         if command == "repair-qwen":
             subparser.add_argument("--config", required=True)

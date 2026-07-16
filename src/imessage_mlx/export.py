@@ -18,6 +18,7 @@ def export_adapter(
     config_path: str | Path | None = None,
     data_report_path: str | Path | None = None,
     architecture_report_path: str | Path | None = None,
+    review_summary_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Export a passing pretrained adapter with provenance and rollback metadata."""
     from imessage_mlx.adapter_runtime import promote_adapter
@@ -29,6 +30,7 @@ def export_adapter(
         config_path=config_path,
         data_report_path=data_report_path,
         architecture_report_path=architecture_report_path,
+        review_summary_path=review_summary_path,
     )
 
 

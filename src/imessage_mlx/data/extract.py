@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
 from imessage_mlx.data.attributed_body import decode_attributed_body
+from imessage_mlx.data.contacts import resolve_macos_contact_names
 from imessage_mlx.data.inspect_schema import column_names, inspect_schema
 from imessage_mlx.data.normalize import normalize_text
 from imessage_mlx.data.redact import load_or_create_key, pseudonym
@@ -55,6 +56,9 @@ def _build_query(message_columns: set[str], tables: set[str]) -> str:
         _select("service", message_columns),
         _select("item_type", message_columns),
         _select("associated_message_type", message_columns),
+        _select("reply_to_guid", message_columns),
+        _select("thread_originator_guid", message_columns),
+        _select("thread_originator_part", message_columns),
         _select("balloon_bundle_id", message_columns),
         _select("is_deleted", message_columns),
         _select("date_retracted", message_columns),
@@ -93,6 +97,8 @@ def extract_messages(
     redaction: dict[str, bool] | None = None,
     include_attachment_marker: bool = True,
     minimum_body_recovery_rate: float = 0.90,
+    include_contact_names: bool = False,
+    contact_names: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     schema = inspect_schema(database)
     tables = set(schema["tables"])
@@ -109,6 +115,18 @@ def extract_messages(
         with open_readonly(database) as connection:
             connection.row_factory = __import__("sqlite3").Row
             handle_map = _lookup_map(connection, "handle", "id") if "handle" in tables else {}
+            resolved_contact_names: Mapping[str, str] = {}
+            if include_contact_names:
+                resolved_contact_names = (
+                    dict(contact_names)
+                    if contact_names is not None
+                    else resolve_macos_contact_names(handle_map.values())
+                )
+                unique_handles = set(handle_map.values())
+                counters["contact_handles_considered"] = len(unique_handles)
+                counters["contact_handles_resolved"] = sum(
+                    handle in resolved_contact_names for handle in unique_handles
+                )
             chat_map = (
                 _lookup_map(connection, "chat", "chat_identifier") if "chat" in tables else {}
             )
@@ -162,6 +180,8 @@ def extract_messages(
                     else handle_map.get(handle_rowid, str(handle_rowid or "unknown"))
                 )
                 message_identity = row["guid"] or row["message_rowid"]
+                reply_to_guid = row["reply_to_guid"]
+                thread_originator_guid = row["thread_originator_guid"]
                 timestamp_ns = apple_timestamp_to_unix_ns(row["date"])
                 if body_source == "text":
                     counters["recovered_text"] += 1
@@ -169,10 +189,27 @@ def extract_messages(
                     counters["recovered_attributed_body"] += 1
                 counters["retained_rows"] += 1
                 counters["outgoing_rows" if is_from_me else "incoming_rows"] += 1
+                if reply_to_guid:
+                    counters["retained_reply_links"] += 1
+                if thread_originator_guid:
+                    counters["retained_thread_links"] += 1
                 is_group = group_counts.get(chat_rowid, 0) > 1
                 counters["group_rows" if is_group else "one_to_one_rows"] += 1
-                yield {
+                record = {
                     "message_id": pseudonym(message_identity, key, "message"),
+                    "reply_to_message_id": (
+                        pseudonym(reply_to_guid, key, "message") if reply_to_guid else None
+                    ),
+                    "thread_root_message_id": (
+                        pseudonym(thread_originator_guid, key, "message")
+                        if thread_originator_guid
+                        else None
+                    ),
+                    "thread_originator_part": (
+                        str(row["thread_originator_part"])
+                        if row["thread_originator_part"] is not None
+                        else None
+                    ),
                     "chat_id": pseudonym(chat_identity, key, "chat"),
                     "timestamp_ns": timestamp_ns,
                     "sender_role": "me" if is_from_me else "other",
@@ -182,6 +219,14 @@ def extract_messages(
                     "is_group": is_group,
                     "service": str(row["service"] or "unknown"),
                 }
+                if include_contact_names:
+                    sender_name = (
+                        "Me" if is_from_me else resolved_contact_names.get(participant_identity)
+                    )
+                    record["sender_name"] = sender_name
+                    if sender_name and not is_from_me:
+                        counters["incoming_rows_with_contact_name"] += 1
+                yield record
 
     written = write_jsonl(output_path, records())
     eligible = counters["retained_rows"] + counters["excluded_unrecoverable_body"]

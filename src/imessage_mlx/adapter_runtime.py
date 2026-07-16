@@ -346,7 +346,7 @@ def validate_convergence_data_semantics(
     report_path: str | Path,
     environment_dir: str | Path,
     *,
-    minimum_similarity: float = 0.25,
+    minimum_similarity: float = 0.70,
     project_root: str | Path | None = None,
 ) -> dict[str, Any]:
     root = Path(project_root or Path.cwd()).resolve()
@@ -468,6 +468,7 @@ def promote_adapter(
     config_path: str | Path | None = None,
     data_report_path: str | Path | None = None,
     architecture_report_path: str | Path | None = None,
+    review_summary_path: str | Path | None = None,
 ) -> dict[str, Any]:
     source = Path(adapter_dir)
     evaluation_path = Path(evaluation_report_path)
@@ -476,6 +477,21 @@ def promote_adapter(
         raise ValueError("Adapter evaluation did not pass the promotion gate")
     if evaluation.get("semantic") is None:
         raise ValueError("Adapter promotion requires local semantic evaluation evidence")
+    if review_summary_path is None:
+        raise ValueError("Adapter promotion requires a completed human review summary")
+    review_path = Path(review_summary_path)
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    if review.get("human_approved") is not True:
+        raise ValueError("Human review summary is not approved")
+    reviewed_groups = review.get("reviewed_target_groups")
+    if (
+        isinstance(reviewed_groups, bool)
+        or not isinstance(reviewed_groups, int)
+        or reviewed_groups < 20
+    ):
+        raise ValueError("Human review must cover at least 20 target groups")
+    if review.get("changed_fact_failures") != 0:
+        raise ValueError("Human review found changed facts or lacks a zero-failure attestation")
     destination = Path(destination_dir)
     ensure_private_dir(destination.parent)
     temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
@@ -483,6 +499,7 @@ def promote_adapter(
     try:
         shutil.copytree(source, temporary / "adapter", dirs_exist_ok=True)
         shutil.copy2(evaluation_path, temporary / "evaluation.json")
+        shutil.copy2(review_path, temporary / "human-review-summary.json")
         training_report_path = source / "training-report.json"
         training_report = (
             json.loads(training_report_path.read_text(encoding="utf-8"))
@@ -574,6 +591,9 @@ def promote_adapter(
                 if path.is_file()
             },
             "evaluation_ready_to_promote": True,
+            "human_review_approved": True,
+            "human_reviewed_target_groups": reviewed_groups,
+            "human_review_summary_sha256": sha256_file(review_path),
         }
         write_json(temporary / "data-manifest.json", manifest)
         for path in temporary.rglob("*"):

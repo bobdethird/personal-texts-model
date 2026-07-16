@@ -39,9 +39,23 @@ def test_promotion_requires_passing_evaluation_and_hashes_artifact(tmp_path: Pat
     )
     evaluation = tmp_path / "evaluation.json"
     write_json(evaluation, {"ready_to_promote": False})
+    review = tmp_path / "review.json"
+    write_json(
+        review,
+        {
+            "human_approved": True,
+            "reviewed_target_groups": 20,
+            "changed_fact_failures": 0,
+        },
+    )
 
     with pytest.raises(ValueError, match="did not pass"):
-        promote_adapter(adapter, evaluation, tmp_path / "final")
+        promote_adapter(
+            adapter,
+            evaluation,
+            tmp_path / "final",
+            review_summary_path=review,
+        )
 
     write_json(
         evaluation,
@@ -50,7 +64,15 @@ def test_promotion_requires_passing_evaluation_and_hashes_artifact(tmp_path: Pat
             "semantic": {"mean_generated_source_similarity": 0.99},
         },
     )
-    manifest = promote_adapter(adapter, evaluation, tmp_path / "final")
+    with pytest.raises(ValueError, match="human review"):
+        promote_adapter(adapter, evaluation, tmp_path / "final")
+
+    manifest = promote_adapter(
+        adapter,
+        evaluation,
+        tmp_path / "final",
+        review_summary_path=review,
+    )
 
     assert manifest["evaluation_ready_to_promote"] is True
     assert "adapter/adapter.safetensors" in manifest["adapter_files"]
@@ -62,9 +84,16 @@ def test_promotion_requires_passing_evaluation_and_hashes_artifact(tmp_path: Pat
     assert manifest["architecture"] == "flan_t5"
     assert manifest["source_prefix"] == "rewrite: "
     assert manifest["lora_target_modules"] == ["q", "v"]
+    assert manifest["human_review_approved"] is True
+    assert (tmp_path / "final/human-review-summary.json").exists()
 
     (tmp_path / "final/old-marker").write_text("rollback")
-    second = promote_adapter(adapter, evaluation, tmp_path / "final")
+    second = promote_adapter(
+        adapter,
+        evaluation,
+        tmp_path / "final",
+        review_summary_path=review,
+    )
     rollback = Path(second["rollback_artifact"])
     assert (rollback / "old-marker").read_text() == "rollback"
 

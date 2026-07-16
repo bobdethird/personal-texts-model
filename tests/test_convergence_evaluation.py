@@ -10,6 +10,7 @@ from imessage_mlx.convergence_evaluation import (
     STYLE_KINDS,
     compare_convergence_evaluations,
     create_convergence_comparison_review,
+    create_convergence_pair_review,
     evaluate_convergence_predictions,
 )
 from imessage_mlx.utils import write_json, write_jsonl
@@ -123,9 +124,7 @@ def test_convergence_and_style_metrics_reward_register_invariant_outputs(
     copied_report = _evaluate(tmp_path, "copied", _rows(outputs=_sources()))
     converged_report = _evaluate(tmp_path, "converged", _rows())
 
-    copied_agreement = copied_report["convergence"][
-        "mean_within_target_output_pairwise_agreement"
-    ]
+    copied_agreement = copied_report["convergence"]["mean_within_target_output_pairwise_agreement"]
     converged_agreement = converged_report["convergence"][
         "mean_within_target_output_pairwise_agreement"
     ]
@@ -229,8 +228,81 @@ def test_private_grouped_review_contains_four_sources_and_both_model_outputs(
     assert "**current output**" in review
     assert "**pilot output**" in review
     assert summary["sampled_target_groups"] == 1
+    assert summary["human_approved"] is False
+    assert summary["reviewed_target_groups"] == 0
+    assert summary["changed_fact_failures"] is None
     assert summary["message_text_persisted_in_summary"] is False
     serialized_summary = json.dumps(json.loads(summary_path.read_text(encoding="utf-8")))
     assert "Would you please meet me" not in serialized_summary
     assert "ill meet you by the station" not in serialized_summary
     assert review_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_private_pair_review_requires_complete_groups_and_writes_safe_summary(
+    tmp_path: Path,
+) -> None:
+    pairs = tmp_path / "pairs.jsonl"
+    rows = _rows()
+    for row in rows:
+        row["semantic_similarity"] = 0.95
+        row["source"] = row.pop("neutral_text", row["source"])
+        row["target"] = row.pop("target_text", row["target"])
+        row["grounding_stratum"] = "historical"
+        row["generation_fingerprint"] = "fingerprint"
+        row["context_bundle"] = {
+            "exact_links": [],
+            "recent_turns": [],
+            "retrieved_evidence": [
+                {
+                    "message_id": "evidence",
+                    "role": "me",
+                    "text": "The station is beside the library.",
+                    "relation": "historical_retrieval",
+                }
+            ],
+            "glossary_entries": [],
+        }
+        row["semantic"] = {
+            "resolved_paraphrase": "I plan to meet you near the station at 7.",
+            "atomic_propositions": ["The author will meet the recipient at 7."],
+            "resolved_entities": [],
+            "slang_interpretations": [
+                {
+                    "expression": "ill",
+                    "interpretation": "A casual spelling of 'I will'.",
+                    "scope": "widespread",
+                    "evidence_ids": [],
+                }
+            ],
+            "remaining_ambiguities": [],
+        }
+    write_jsonl(pairs, rows)
+    review_path = tmp_path / "pair-review.md"
+
+    summary = create_convergence_pair_review(
+        pairs,
+        review_path,
+        sample_size=1,
+    )
+
+    review = review_path.read_text(encoding="utf-8")
+    assert "**Authored target**" in review
+    assert "**Retrieved historical evidence**" in review
+    assert "**Resolved meaning**" in review
+    assert "**Extracted semantic propositions**" in review
+    assert "**Slang and texting expressions**" in review
+    assert "`widespread`" in review
+    assert "local score 0.950" in review
+    assert summary["human_approved"] is False
+    assert summary["semantic_or_fact_failures"] is None
+    serialized = json.dumps(
+        json.loads(review_path.with_suffix(".summary.json").read_text(encoding="utf-8"))
+    )
+    assert "ill meet you by the station" not in serialized
+
+    write_jsonl(tmp_path / "incomplete.jsonl", rows[:-1])
+    with pytest.raises(ValueError, match="complete four-source"):
+        create_convergence_pair_review(
+            tmp_path / "incomplete.jsonl",
+            tmp_path / "incomplete.md",
+        )
