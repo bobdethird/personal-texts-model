@@ -107,18 +107,5 @@ def causal_lm_loss(model: TransformerLM, inputs: mx.array, targets: mx.array) ->
     return nn.losses.cross_entropy(logits, targets, reduction="mean")
 
 
-def masked_causal_lm_loss(
-    model: TransformerLM,
-    inputs: mx.array,
-    targets: mx.array,
-    loss_mask: mx.array,
-) -> mx.array:
-    logits = model(inputs)
-    token_losses = nn.losses.cross_entropy(logits, targets, reduction="none")
-    mask = loss_mask.astype(token_losses.dtype)
-    denominator = mx.maximum(mx.sum(mask), mx.array(1.0, dtype=token_losses.dtype))
-    return mx.sum(token_losses * mask) / denominator
-
-
 def perplexity(loss: float) -> float:
     return math.exp(min(loss, 50.0))

@@ -20,22 +20,43 @@ database identities with keyed HMAC pseudonyms.
 3. `extract.py` filters non-text events and emits canonical pseudonymized records.
 4. `normalize.py` normalizes Unicode and whitespace without correcting the author's style.
 5. `redact.py` replaces obvious URLs, email addresses, and phone numbers.
-6. `sessions.py` groups chronologically adjacent messages into conversations.
+6. `sessions.py` groups chronologically adjacent messages into conversations for the reply model.
 7. `split.py` deduplicates complete sessions and performs chronological splitting with guard bands.
 8. `privacy_audit.py` verifies canonical fields, hashed identifiers, roles, and obvious-PII removal.
-9. `rewrite.py` validates neutral-to-styled pairs and serializes the separate rewrite task.
-10. `pair_generation.py` optionally asks OpenAI to neutralize recent outgoing messages in resumable,
-    structured batches without logging message text.
-11. `adapters.py` converts chronological pairs into BART source/target and MLX-LM
-    prompt/completion records, removes normalized and fuzzy cross-split duplicates, reports signal
-    strata, filters deterministic fact conflicts and length outliers, caps exact/surface-only
-    examples, and writes a frozen architecture-benchmark subset.
-12. `repair.py` can reconstruct only low-signal pairs through blinded semantic JSON. Failed fact,
-    schema, or content checks retain the original pair.
+9. `llm_dataset.py` generates judge-screened rewrite pairs with hosted model decisions only.
+10. `censor.py` screens every accepted pair and is the only publisher of training splits.
 
 Splitting complete sessions before tokenizer training prevents adjacent messages or overlapping
 windows from leaking across train, validation, and test data. The tokenizer sees only the training
 split.
+
+## LLM-only rewrite dataset
+
+`llm_dataset.py` deliberately contains no linguistic or quality heuristics. Local code performs
+only mechanical work: it slices each chat's chronological messages into fixed-size windows, labels
+speakers with first names, checkpoints finished windows for resume, and serializes results. Every
+data decision is made by a hosted GPT model through structured-output calls:
+
+1. A proposal call reads the window and decides how the owner's messages group into turns, which
+   turns are usable, and what a generic assistant would have drafted to express the same meaning
+   (slang translated from the model's own knowledge and the conversation, proper nouns preserved
+   verbatim). It also writes a one-sentence context note for human review.
+2. A judge call re-reads the window plus the proposed pairs and accepts or rejects each one,
+   checking meaning preservation, assistant-neutral drafting, verbatim proper nouns, and coherent
+   turn grouping.
+3. A censor call (in `censor.py`) screens each accepted pair in full — draft, original, and note —
+   and excludes rows containing adult content (vulgar, violent, or sexual material) or secrets
+   and super-personal information (passwords, API keys, credentials, verification codes,
+   financial numbers, government identifiers). Exclusion drops the row entirely; nothing is
+   redacted or rewritten. Screening failures are excluded too, so publication is fail-closed.
+
+Responses are validated mechanically only: echoed identifiers, in-range strictly ascending
+owner-only indices, no index reuse, one verdict per candidate or row, and category consistency.
+Malformed responses are retried with the previous error attached; windows or batches that stay
+malformed are recorded as failed with no local fallback. Censor-allowed pairs are ordered
+chronologically and sliced into train/valid/test by configurable fractions, then serialized as
+generic records, BART `source`/`target` files, and MLX-LM `prompt`/`completion` files under one
+dataset root. Only censor-approved pairs ever reach those files.
 
 ## Tokenizer
 
@@ -43,12 +64,12 @@ The project trains a byte-level BPE tokenizer with explicit conversation tokens:
 
 ```text
 <|bos|> <|eos|> <|conversation|> <|me|> <|other|> <|turn_end|>
-<|attachment|> <|url|> <|email|> <|phone|> <|rewrite|> <|draft|>
+<|attachment|> <|url|> <|email|> <|phone|>
 ```
 
 Byte-level tokenization provides complete coverage for emoji, multilingual text, unusual spelling,
 and punctuation without a pretrained vocabulary. The trainer reserves the complete byte alphabet.
-Reply models request a 4,096-token vocabulary; the smaller rewrite models request 2,048.
+Reply models request a 4,096-token vocabulary.
 
 ## Model
 
@@ -62,9 +83,9 @@ Reply models request a 4,096-token vocabulary; the smaller rewrite models reques
 - Residual connections
 - Strict configured context length
 
-The reply model and legacy tiny rewrite baseline are initialized randomly. The recommended rewrite
-path instead trains a low-rank adapter over a checksum-cached pretrained base model. Base weights
-remain separate from the sensitive local adapter.
+The reply model is initialized randomly. The rewrite path instead trains a low-rank adapter over a
+checksum-cached pretrained base model. Base weights remain separate from the sensitive local
+adapter.
 
 ## Training
 
@@ -72,64 +93,19 @@ remain separate from the sensitive local adapter.
 next-token cross-entropy. Training uses AdamW, gradient clipping, warmup plus cosine decay, compiled
 fixed-shape MLX updates, periodic validation, best-checkpoint selection, and early stopping.
 
-Rewrite data uses an explicit task prompt:
+The adapter path trains isolated environments against the same frozen records:
 
-```text
-<|bos|><|rewrite|>
-<|draft|>neutral draft<|turn_end|>
-<|me|>styled target<|turn_end|>
-<|eos|>
-```
-
-Complete pairs are packed without crossing a context boundary. An aligned loss mask supervises only
-the styled target and its turn terminator; prompt and padding tokens do not affect optimization.
-Reply models retain the original unmasked causal objective. Rewrite and reply models are exported as
-separate artifacts.
-
-The adapter path benchmarks two isolated environments against the same frozen records:
-
-- BART-base uses PEFT `SEQ_2_SEQ_LM` LoRA on MPS. The encoder receives the complete neutral draft
-  and the decoder learns only the styled target.
+- BART-base (and the Flan-T5/Marian challengers) use PEFT `SEQ_2_SEQ_LM` LoRA on MPS. The encoder
+  receives the complete draft and the decoder learns only the owner's real text.
 - Qwen3-0.6B-4bit uses MLX-LM QLoRA with `--mask-prompt`, so instruction and draft tokens do not
   contribute to loss.
 
 The environments live under ignored `work/envs/` and do not change the pinned custom-model
 environment. Training uses deterministic seeds, small batches, gradient accumulation, validation,
-best-adapter saves, and early stopping. BART applies an exact 256-token source/target guard before
-training; MLX-LM receives the same maximum sequence length. Adapters are neither fused nor uploaded.
+best-adapter saves, and early stopping. Adapters are neither fused nor uploaded.
 
-Multi-register convergence is a versioned data contract layered onto chronological style targets.
-Before splitting, a local temporal BM25 index searches only messages older than each target across
-all chats. A context bundle separates explicit links, recent turns, retrieved historical evidence,
-and human-approved glossary definitions. OpenAI Stage A extracts typed semantics, must cite bundle
-evidence for resolved entities, records every slang or filler reading with a widespread/in-group/
-uncertain scope (in-group readings require cited evidence and uncertain expressions stay verbatim as
-protected literals), and emits a reworded fully resolved one-sentence paraphrase that is
-rejected when it near-duplicates the target; a separate Stage B request receives only the semantic
-object and emits exactly four labeled sources. Local scoring compares each source against that
-paraphrase (or the target when it scores higher), so context-dependent targets are judged against
-their resolved meaning. Glossary proposals are mined case-insensitively from corpus-rare terms
-rather than capitalization. The manifest fingerprints input files, selected context,
-retrieval/glossary fingerprints, model, prompts, schemas, and style set. Semantics and variants
-checkpoint independently, while only complete target groups are published.
-
-Each generated row carries `target_id`, `source_pair_id`, `variant_kind`, `split`, and one generation
-fingerprint. Adapter
-deduplication treats repeated targets from the same owner group as intentional but rejects matches
-owned by another group or split. Local sentence-transformer scoring runs before dataset assembly.
-The pilot uses all four rows and reports effective target exposure; larger runs must reconsider a
-group-aware rotating sampler if memorization rises.
-
-Retrieval is a pair-generation aid, not an adapter input. Live rewriting remains draft-only; the
-upstream assistant is responsible for using conversation and project knowledge to create a
-semantically correct draft before style transformation.
-
-Model selection is task-specific. Reply selection retains its original one-million-token hard
-minimum and ten-token-per-parameter heuristic. Rewrite selection considers only the training split,
-requires at least 10,000 unique pairs and 100,000 supervised target tokens, then selects the largest
-rewrite candidate with at least 1.5 supervised target tokens per parameter. It returns no model
-when the gates fail. The rewrite presets are approximately 188K and 291K parameters at a full
-2,048-token vocabulary.
+Reply model selection retains its one-million-token hard minimum and ten-token-per-parameter
+policy.
 
 Each checkpoint contains:
 
@@ -151,22 +127,16 @@ validation loss, dependency versions, compilation mode, and random-initializatio
 
 `src/imessage_mlx/evaluate.py` measures validation and untouched-test loss, overall and `me`-turn
 perplexity, a unigram baseline, token n-gram overlap with training data, and obvious-PII patterns in
-sampled generations for reply models. `src/imessage_mlx/rewrite_evaluation.py` separately evaluates
-rewrite predictions with local embedding similarity, protected-fact preservation, a held-out
-character-style classifier, style-marker gap closure, malformed/repetition rates, and exact
-training-target matches. Reports store aggregate values, never matched text.
+sampled generations for reply models. Reports store aggregate values, never matched text.
 
-`src/imessage_mlx/convergence_evaluation.py` validates complete four-register groups, then reports
-protected facts, target/source similarity, normalized input copying, style distance and variance,
-within-target output agreement, worst-register behavior, fluency, and training-target memorization.
-Baseline and pilot reports must have the same challenge fingerprint. Expansion uses explicit gates
-rather than a weighted score and still requires a private grouped human review.
+Rewrite adapters are reviewed by a human: `review-llm-dataset` renders generated pairs and
+`review-censor` renders every censor-excluded row before training, and `predict-adapter` produces
+held-out predictions to read directly. There is no automated promotion gate; nothing replaces human
+judgment of the private outputs.
 
-`src/imessage_mlx/export.py` creates an inference-only artifact containing model weights,
+`src/imessage_mlx/export.py` creates an inference-only reply artifact containing model weights,
 configuration, tokenizer, task capabilities, metrics, and split hashes. Optimizer state and source
-text are excluded. Adapter export additionally records pretrained-base provenance, adapter hashes,
-model license, deterministic generation defaults, no-upload/no-auto-send warnings, and a
-timestamped rollback artifact when replacing a prior promotion.
+text are excluded.
 
 `src/imessage_mlx/audit.py` rechecks the complete Gate A-D evidence, test suite, private file
 permissions, Git exclusions, artifact hash, and fresh-process chat command.

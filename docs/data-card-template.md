@@ -16,19 +16,18 @@ database. Attachments are excluded.
 - Validation and test perplexity
 - Memorization-probe aggregates
 - Adapter architecture, exact base-model revision, dependency pins, and adapter hash
-- Accepted pair counts plus normalized/fuzzy, fact-conflict, and length removals
-- Original and balanced exact/surface/high-overlap/substantive strata
-- Local semantic model revision and content/style/fluency gate metrics
-- Deterministic generation settings, local-only status, and rollback artifact
-- Human comparison-review status and explicit no-automatic-sending warning
-- Convergence schema, prompt, model, input, and generation fingerprints
-- Stage A and Stage B token usage, retry counts, and no-text rejection aggregates
-- Unique convergence target groups by split and complete rows by source register
-- Local source-target semantic model revision, minimum/mean gates, and rejected group counts
-- Same-challenge baseline/pilot fingerprint; per-register copy, fact, style, and convergence metrics
-- Effective rows per target, target-exposure policy, and grouped human-review decision
-- Explicit disclosure that complete target text was externally processed by Stage A with
-  `store=False`, while Stage B received only sensitive semantic JSON
+- LLM dataset schema and prompt versions, proposal and judge model IDs
+- Window counts: total, skipped, completed, failed (proposal/judge) with retry aggregates
+- Example counts: proposed, accepted, rejected, and the judge acceptance rate
+- Censor schema and prompt versions, censor model ID
+- Censor counts: screened, allowed, excluded by category (adult content, sensitive secret,
+  unscreened failure), and confirmation that published splits are censor-approved only
+- Split sizes and the split fractions used
+- Proposal, judge, and censor token usage
+- Human review status of the generated pair sample, the censor exclusions, and held-out predictions
+- Deterministic generation settings, local-only status, and no-automatic-sending warning
+- Explicit disclosure that complete conversation windows, including incoming messages, were
+  externally processed by the configured OpenAI models with `store=False`
 
 Do not include message samples, handles, chat identifiers, attachment names, or generated private
 text in this document.

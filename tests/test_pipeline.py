@@ -145,18 +145,5 @@ def test_synthetic_end_to_end_pipeline_in_fresh_process(synthetic_db: Path, tmp_
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    rewrite_code = (
-        "from imessage_mlx.generate import generate_rewrite; "
-        f"generate_rewrite({str(outputs / 'final')!r}, 'hello', max_new_tokens=3)"
-    )
-    rewrite_result = subprocess.run(
-        [sys.executable, "-c", rewrite_code],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert rewrite_result.returncode != 0
-    assert "not trained for rewrite" in rewrite_result.stderr
     assert (outputs / "final/model.safetensors").exists()
     assert (outputs / "final/tokenizer/tokenizer.json").exists()

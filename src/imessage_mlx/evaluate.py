@@ -100,10 +100,7 @@ def evaluate_checkpoint(
         training_config = json.loads(training_config_path.read_text(encoding="utf-8"))
         task = str(training_config.get("task", "reply"))
         if task != "reply":
-            raise ValueError(
-                "The current evaluator supports reply checkpoints only; "
-                "rewrite metrics require target masks"
-            )
+            raise ValueError("The evaluator supports reply checkpoints only")
     model = load_model(checkpoint_path)
     tokenizer = load_tokenizer(checkpoint_path / "tokenizer")
     data_path = Path(data_dir)

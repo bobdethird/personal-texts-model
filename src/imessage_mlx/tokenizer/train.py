@@ -20,8 +20,6 @@ SPECIAL_TOKENS = [
     "<|url|>",
     "<|email|>",
     "<|phone|>",
-    "<|rewrite|>",
-    "<|draft|>",
 ]
 
 

@@ -26,9 +26,7 @@ def test_resolves_phone_and_email_handles_without_returning_unmatched_contacts(
         ),
     )
 
-    resolved = resolve_macos_contact_names(
-        ["+12125550199", "alice@example.com", "+13105550101"]
-    )
+    resolved = resolve_macos_contact_names(["+12125550199", "alice@example.com", "+13105550101"])
 
     assert resolved == {
         "+12125550199": "Alice Example",

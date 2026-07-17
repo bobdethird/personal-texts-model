@@ -23,11 +23,8 @@ def test_trains_local_tokenizer_with_unique_special_tokens(tmp_path: Path) -> No
     assert all(token_id is not None for token_id in ids)
     assert len(ids) == len(set(ids))
     assert report["training_source"] == "train split only"
-    assert tokenizer.encode("<|rewrite|>", add_special_tokens=False).ids == [
-        tokenizer.token_to_id("<|rewrite|>")
-    ]
-    assert tokenizer.encode("<|draft|>", add_special_tokens=False).ids == [
-        tokenizer.token_to_id("<|draft|>")
+    assert tokenizer.encode("<|turn_end|>", add_special_tokens=False).ids == [
+        tokenizer.token_to_id("<|turn_end|>")
     ]
     text = "héllo 😊\nsecond line"
     assert tokenizer.decode(tokenizer.encode(text).ids) == text

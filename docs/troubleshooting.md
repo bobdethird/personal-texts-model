@@ -37,8 +37,7 @@ before retraining.
 
 The reply task refuses a normal run because a from-scratch Transformer would mostly memorize the
 corpus. You can still inspect the synthetic smoke model in the test suite, but do not present it as
-a useful personal language model. Rewrite models use their separate pair, target-token, and
-tokens-per-parameter policy.
+a useful personal language model.
 
 ## The model repeats phrases or produces incoherent text
 
@@ -56,59 +55,39 @@ uv run imessage-mlx chat \
 Sampling changes cannot add factual knowledge or reasoning. A larger model trained on the same small
 corpus may memorize more without becoming more coherent.
 
-## Rewrite says the model was not trained for rewrite generation
+## OpenAI dataset generation fails
 
-`rewrite` accepts only an artifact trained with `configs/model-rewrite-190k.yaml` or an eligible
-larger rewrite preset and exported from that checkpoint. A normal reply model cannot reliably
-reinterpret its input as a draft. Train and export the rewrite artifact separately, then pass it
-with `--model outputs/rewrite-final`.
-
-## Rewrite corpus stats select no model
-
-Rewrite selection uses only the training split. It requires at least 10,000 unique training pairs,
-100,000 supervised target tokens, and 1.5 target tokens per parameter. Generate and review more
-unique pairs, then rebuild the splits and train a fresh 2,048-token rewrite tokenizer. Do not reuse
-an old 4,096-token tokenizer or edit the selection report to bypass a failed gate.
-
-## OpenAI pair generation fails
-
-Put `OPENAI_API_KEY` and optionally `OPENAI_MODEL` in the ignored project-root `.env` file. The
-blind generator retries transient API and rate-limit failures, writes each successful structured
-stage immediately, and can be rerun without paying to regenerate completed target identifiers. Its
-report contains aggregate error types and token usage, never message text. Run
-`prepare-style-targets` before `generate-convergence-pilot`.
-
-`generate-rewrite-pairs` is intentionally blocked by default. Its target-visible, minimal-edit
-neutralization produced an identity-heavy corpus and is retained only to reproduce old experiments.
+Put `OPENAI_API_KEY` and optionally `OPENAI_MODEL` in the ignored project-root `.env` file.
+`build-llm-dataset` retries transient API and rate-limit failures, checkpoints every completed
+window into `results.jsonl`, and can be rerun on the same output directory without paying to
+regenerate finished windows. The censor checkpoints per pair into `censor.jsonl` the same way.
+Reports contain aggregate error types and token usage, never message text.
 
 An unknown model error means the configured model ID is unavailable to the account. Set
-`OPENAI_MODEL` to an accessible Responses API model and rerun the same command.
+`OPENAI_MODEL` to an accessible Responses API model and rerun the same command. Changing the model,
+window size, or extracted messages requires a fresh output directory because the resume checks
+refuse mixed artifacts.
 
-## A project name, slang term, or conversational reference is interpreted incorrectly
+## A generated pair misreads slang or a project name
 
-Run `propose-entity-glossary`, inspect `review-entity-glossary`, and approve only definitions
-supported by the cited private messages. Rebuild style targets afterward. The generated pair review
-shows exact replies, recent turns, historical retrieval, glossary definitions, extracted
-propositions, and every slang reading with its widespread/in-group/uncertain scope. Reject any group
-whose interpretation is not supported there. Widespread texting slang, including short abbreviations
-such as "ts" and generic address terms such as "brodie", is canonicalized directly. In-group readings
-are usually proper nouns or coined names for the author's projects, people, and personal topics, and
-can only be resolved through an approved glossary entry or retrieved message evidence; otherwise the
-extractor must mark them uncertain and keep them verbatim. Do not solve ambiguity by approving a guessed
-glossary definition or allowing future messages into retrieval.
+There is no local dictionary to edit; interpretation is entirely the hosted model's job. Read
+`review-llm-dataset` output — every pair carries the model's context note and the judge's verdict
+next to its timestamp. If misreadings cluster, rerun the pilot with a stronger `--model` (or a
+stronger `--judge-model`) and compare acceptance rates before scaling up.
 
-## A rewrite pair exceeds the context window
+## The censor excluded too much or too little
 
-Each neutral draft and styled target must fit together in one model context. The encoder reports the
-pair identifier and token count but does not print its private text. Shorten or exclude that pair;
-do not silently truncate the styled target.
+Read `review-censor` output: it renders every excluded row with its category and the censor's
+reason. The censor intentionally errs toward exclusion when uncertain, and screening failures are
+excluded rather than published. If exclusions look wrong in bulk, rerun `censor-llm-dataset` with a
+stronger `--model` on a fresh output directory; do not hand-edit the published splits.
 
 ## A rewrite changes the intended meaning
 
-Use the pretrained BART adapter path, deterministic decoding, and the rewrite evaluation gate. The
-legacy tiny Transformer cannot reliably preserve semantics. Promotion requires protected-fact and
-local semantic checks, but those checks are not proof of equivalence; review every output before
-use. A capable upstream model should remain responsible for factual content.
+Use deterministic decoding and read the held-out predictions directly before trusting an adapter.
+Dataset acceptance is judged per pair during generation, but that is not proof of equivalence;
+review every output before use. A capable upstream model should remain responsible for factual
+content.
 
 ## An adapter environment is missing a package
 
@@ -135,23 +114,6 @@ uv run imessage-mlx rewrite-adapter "your draft"
 
 The isolated BART and Qwen environments are unaffected. Re-run the sync after changing project
 source because a non-editable install copies the package into `.venv`.
-
-## Adapter promotion is blocked
-
-Open the aggregate evaluation report under `work/rewrite/evaluation/`. Promotion is intentionally
-blocked for changed numbers/placeholders/negation, low local semantic similarity, no measurable
-style lift, empty or repeated output, or an artifact that matches a training target. Keep the
-existing promoted adapter. Do not edit `ready_to_promote` manually.
-
-If content is strong but the existing pairs show excessive exact, surface-only, or high-overlap
-strata, run the local 500-pair repair pilot. It reconstructs from semantic JSON without exposing the
-original wording to the second stage and keeps every pair that fails a fact check:
-
-```bash
-uv run imessage-mlx repair-rewrite-pairs-local --limit 500
-```
-
-Rebuild splits and retrain only if the pilot improves held-out content and style distributions.
 
 ## The Mac becomes hot or runs out of memory
 

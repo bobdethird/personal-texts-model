@@ -4,13 +4,105 @@ import argparse
 import math
 import os
 import random
+import re
+import sys
 import time
+from collections import Counter
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from imessage_mlx.config import load_yaml
 from imessage_mlx.seq2seq_profile import format_seq2seq_source, resolve_seq2seq_profile
 from imessage_mlx.utils import ensure_private_dir, read_jsonl, write_json, write_jsonl
+
+REWRITE_INSTRUCTION = (
+    "Rewrite the draft in the learned casual texting style. Preserve every fact, intent, "
+    "question, negation, and degree of uncertainty. Return only the rewritten message.\n\nDraft:\n"
+)
+WORD_PATTERN = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?")
+
+
+def normalized_words(text: str) -> list[str]:
+    return WORD_PATTERN.findall(text.lower().replace("’", "'"))
+
+
+def multiset_jaccard(left: Sequence[str], right: Sequence[str]) -> float:
+    left_counts = Counter(left)
+    right_counts = Counter(right)
+    union = sum((left_counts | right_counts).values())
+    if not union:
+        return 1.0
+    return sum((left_counts & right_counts).values()) / union
+
+
+def transformation_sampling_weights(
+    rows: Sequence[Mapping[str, Any]],
+    settings: Mapping[str, Any] | None,
+) -> tuple[list[float], dict[str, Any]]:
+    """Return deterministic sampling weights and an auditable distribution summary."""
+    options = dict(settings or {})
+    enabled = bool(options.get("enabled", False))
+    if not enabled:
+        return [1.0] * len(rows), {
+            "enabled": False,
+            "counts": {"standard": len(rows)},
+            "expected_share": {"standard": 1.0 if rows else 0.0},
+        }
+
+    exact_weight = float(options.get("exact_copy_weight", 0.25))
+    near_threshold = float(options.get("near_copy_threshold", 0.9))
+    near_weight = float(options.get("near_copy_weight", 0.5))
+    strong_threshold = float(options.get("strong_threshold", 0.7))
+    strong_weight = float(options.get("strong_weight", 1.5))
+    minimum_ratio = float(options.get("strong_min_length_ratio", 0.65))
+    maximum_ratio = float(options.get("strong_max_length_ratio", 1.2))
+    require_numbers = bool(options.get("require_source_numbers", True))
+    if min(exact_weight, near_weight, strong_weight) <= 0:
+        raise ValueError("Sampling weights must be positive")
+    if not 0 <= strong_threshold <= near_threshold <= 1:
+        raise ValueError("Sampling thresholds must satisfy 0 <= strong <= near <= 1")
+    if minimum_ratio <= 0 or maximum_ratio < minimum_ratio:
+        raise ValueError("Strong transformation length-ratio bounds are invalid")
+
+    weights: list[float] = []
+    category_counts: Counter[str] = Counter()
+    category_weight: Counter[str] = Counter()
+    for row in rows:
+        source = normalized_words(str(row["source"]))
+        target = normalized_words(str(row["target"]))
+        similarity = multiset_jaccard(source, target)
+        length_ratio = len(target) / max(1, len(source))
+        source_numbers = Counter(token for token in source if token.isdigit())
+        target_numbers = Counter(token for token in target if token.isdigit())
+        numbers_preserved = not (source_numbers - target_numbers)
+
+        if source == target:
+            category, weight = "exact_copy", exact_weight
+        elif similarity >= near_threshold:
+            category, weight = "near_copy", near_weight
+        elif (
+            similarity < strong_threshold
+            and minimum_ratio <= length_ratio <= maximum_ratio
+            and (numbers_preserved or not require_numbers)
+        ):
+            category, weight = "quality_gated_strong", strong_weight
+        else:
+            category, weight = "standard", 1.0
+        weights.append(weight)
+        category_counts[category] += 1
+        category_weight[category] += weight
+
+    total_weight = sum(weights)
+    return weights, {
+        "enabled": True,
+        "settings": options,
+        "counts": dict(sorted(category_counts.items())),
+        "expected_share": {
+            category: round(weight / total_weight, 6)
+            for category, weight in sorted(category_weight.items())
+        },
+    }
 
 
 def _chmod_private_tree(root: Path) -> None:
@@ -46,7 +138,7 @@ def train_seq2seq(
 ) -> dict[str, Any]:
     import torch
     from peft import LoraConfig, TaskType, get_peft_model
-    from torch.utils.data import DataLoader, Dataset
+    from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, DataCollatorForSeq2Seq
 
     config = load_yaml(config_path)
@@ -118,12 +210,27 @@ def train_seq2seq(
             )
 
     collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, return_tensors="pt")
-    generator = torch.Generator().manual_seed(seed)
+    sampling_weights, sampling_report = transformation_sampling_weights(
+        train_rows,
+        config.get("sampling"),
+    )
+    sampling_enabled = bool(sampling_report["enabled"])
+    sampler = (
+        WeightedRandomSampler(
+            sampling_weights,
+            num_samples=len(train_rows),
+            replacement=True,
+            generator=torch.Generator().manual_seed(seed),
+        )
+        if sampling_enabled
+        else None
+    )
     train_loader = DataLoader(
         PairDataset(train_rows),
         batch_size=int(config.get("batch_size", 2)),
-        shuffle=True,
-        generator=generator,
+        shuffle=not sampling_enabled,
+        sampler=sampler,
+        generator=torch.Generator().manual_seed(seed),
         collate_fn=collator,
         num_workers=0,
     )
@@ -135,6 +242,8 @@ def train_seq2seq(
         num_workers=0,
     )
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    trainable_parameters = sum(parameter.numel() for parameter in trainable)
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
     optimizer = torch.optim.AdamW(
         trainable,
         lr=float(config.get("learning_rate", 2e-4)),
@@ -159,6 +268,8 @@ def train_seq2seq(
     started = time.perf_counter()
     history: list[dict[str, Any]] = []
     optimizer.zero_grad(set_to_none=True)
+    total_batches = len(train_loader) * epochs
+    completed_batches = 0
 
     for epoch in range(epochs):
         model.train()
@@ -173,7 +284,27 @@ def train_seq2seq(
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 updates += 1
+            completed_batches += 1
+            if completed_batches % 10 == 0 or batch_index + 1 == len(train_loader):
+                elapsed = max(time.perf_counter() - started, 0.001)
+                batches_per_second = completed_batches / elapsed
+                remaining = max(total_batches - completed_batches, 0)
+                eta_minutes = remaining / batches_per_second / 60
+                fraction = completed_batches / total_batches
+                width = 30
+                filled = min(width, int(width * fraction))
+                bar = "#" * filled + "-" * (width - filled)
+                print(
+                    f"\r[{bar}] epoch {epoch + 1}/{epochs} "
+                    f"batch {batch_index + 1}/{len(train_loader)} "
+                    f"loss {train_loss / (batch_index + 1):.4f} "
+                    f"{batches_per_second:.2f} batch/s ETA {eta_minutes:.1f}m",
+                    end="",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
+        print("\nvalidating...", file=sys.stderr, flush=True)
         model.eval()
         validation_loss = 0.0
         validation_batches = 0
@@ -189,6 +320,12 @@ def train_seq2seq(
                 "training_loss": train_loss / max(1, len(train_loader)),
                 "validation_loss": validation_loss,
             }
+        )
+        print(
+            f"epoch {epoch + 1}: train_loss={history[-1]['training_loss']:.4f} "
+            f"validation_loss={validation_loss:.4f}",
+            file=sys.stderr,
+            flush=True,
         )
         if validation_loss < best_loss:
             best_loss = validation_loss
@@ -216,6 +353,12 @@ def train_seq2seq(
         "base_model_license": profile.base_model_license,
         "source_prefix": profile.source_prefix,
         "lora_target_modules": list(profile.lora_target_modules),
+        "lora_rank": int(config.get("lora_rank", 8)),
+        "lora_alpha": int(config.get("lora_alpha", 16)),
+        "trainable_parameters": trainable_parameters,
+        "total_parameters": total_parameters,
+        "trainable_parameter_fraction": trainable_parameters / total_parameters,
+        "sampling": sampling_report,
         "train_examples": len(train_rows),
         "validation_examples": len(valid_rows),
         "skipped_oversized_train_examples": original_train_count - len(train_rows),
@@ -261,7 +404,7 @@ def predict_seq2seq(
 
     def predictions():
         with torch.no_grad():
-            for row in rows:
+            for index, row in enumerate(rows, start=1):
                 encoded = tokenizer(
                     format_seq2seq_source(str(row["source"]), profile),
                     return_tensors="pt",
@@ -280,6 +423,21 @@ def predict_seq2seq(
                     for key in ("target_id", "variant_kind", "split", "source_pair_id")
                     if key in row
                 }
+                if index % 10 == 0 or index == len(rows):
+                    elapsed = max(time.perf_counter() - started, 0.001)
+                    rate = index / elapsed
+                    eta_minutes = (len(rows) - index) / rate / 60
+                    fraction = index / len(rows) if rows else 1.0
+                    width = 30
+                    filled = min(width, int(width * fraction))
+                    bar = "#" * filled + "-" * (width - filled)
+                    print(
+                        f"\r[{bar}] {index}/{len(rows)} ({fraction:6.2%}) "
+                        f"{rate:.2f} examples/s ETA {eta_minutes:.1f}m",
+                        end="",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 yield {
                     "pair_id": str(row["pair_id"]),
                     "neutral_text": str(row["source"]),
@@ -291,6 +449,7 @@ def predict_seq2seq(
                 }
 
     count = write_jsonl(output_path, predictions())
+    print(file=sys.stderr)
     elapsed = time.perf_counter() - started
     return {
         "architecture": profile.architecture,
@@ -398,8 +557,6 @@ def rewrite_qwen(
     from mlx_lm import generate, load
     from mlx_lm.sample_utils import make_sampler
 
-    from imessage_mlx.data.adapters import REWRITE_INSTRUCTION
-
     config = load_yaml(config_path)
     model, tokenizer = load(
         _qwen_model_reference(config),
@@ -415,215 +572,6 @@ def rewrite_qwen(
     ).strip()
 
 
-def semantic_evaluation(
-    data_path: str | Path,
-    output_path: str | Path,
-    *,
-    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-    model_revision: str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
-) -> dict[str, Any]:
-    import numpy as np
-    import torch
-    from huggingface_hub import snapshot_download
-    from sentence_transformers import SentenceTransformer
-
-    rows = list(read_jsonl(data_path))
-    if not rows:
-        raise ValueError("Semantic evaluation requires predictions")
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    model_path = snapshot_download(model_name, revision=model_revision)
-    model = SentenceTransformer(model_path, device=device)
-    neutral = [str(row["neutral_text"]) for row in rows]
-    target = [str(row["target_text"]) for row in rows]
-    generated = [str(row["generated_text"]) for row in rows]
-    neutral_embeddings = model.encode(neutral, normalize_embeddings=True)
-    target_embeddings = model.encode(target, normalize_embeddings=True)
-    generated_embeddings = model.encode(generated, normalize_embeddings=True)
-    generated_source = np.sum(generated_embeddings * neutral_embeddings, axis=1)
-    target_source = np.sum(target_embeddings * neutral_embeddings, axis=1)
-    generated_target = np.sum(generated_embeddings * target_embeddings, axis=1)
-    report = {
-        "schema_version": 1,
-        "model": model_name,
-        "model_revision": model_revision,
-        "device": device,
-        "examples": len(rows),
-        "mean_generated_source_similarity": float(generated_source.mean()),
-        "mean_target_source_similarity": float(target_source.mean()),
-        "mean_generated_target_similarity": float(generated_target.mean()),
-        "generated_source_below_0_80": int((generated_source < 0.80).sum()),
-        "generated_source_below_0_85": int((generated_source < 0.85).sum()),
-        "target_source_below_0_80": int((target_source < 0.80).sum()),
-        "target_source_below_0_85": int((target_source < 0.85).sum()),
-        "text_persisted_in_report": False,
-        "private_local_evaluation": True,
-    }
-    write_json(output_path, report)
-    return report
-
-
-def _semantic_reference(row: dict[str, Any]) -> str:
-    semantic = row.get("semantic")
-    if not isinstance(semantic, dict):
-        return str(row["target"])
-    paraphrase = semantic.get("resolved_paraphrase")
-    if isinstance(paraphrase, str) and paraphrase.strip():
-        return paraphrase.strip()
-    values: list[str] = []
-    for key in (
-        "speech_act",
-        "atomic_propositions",
-        "entities",
-        "protected_literals",
-        "time_references",
-        "numbers",
-        "modality_uncertainty",
-        "question_intent",
-        "emotion",
-        "intensity",
-        "remaining_ambiguities",
-    ):
-        value = semantic.get(key)
-        if isinstance(value, str) and value.strip():
-            values.append(value.strip())
-        elif isinstance(value, list):
-            values.extend(str(item).strip() for item in value if str(item).strip())
-    for entity in semantic.get("resolved_entities", []):
-        if isinstance(entity, dict):
-            values.extend(
-                str(entity.get(key, "")).strip()
-                for key in ("term", "interpretation")
-                if str(entity.get(key, "")).strip()
-            )
-    for slang in semantic.get("slang_interpretations", []):
-        if isinstance(slang, dict) and str(slang.get("interpretation", "")).strip():
-            values.append(str(slang["interpretation"]).strip())
-    return " ".join(values) or str(row["target"])
-
-
-def convergence_source_semantics(
-    data_path: str | Path,
-    output_path: str | Path,
-    report_path: str | Path,
-    *,
-    minimum_similarity: float = 0.70,
-    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-    model_revision: str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
-) -> dict[str, Any]:
-    import numpy as np
-    import torch
-    from huggingface_hub import snapshot_download
-    from sentence_transformers import SentenceTransformer
-
-    if not -1 <= minimum_similarity <= 1:
-        raise ValueError("Minimum semantic similarity must be between -1 and 1")
-    rows = list(read_jsonl(data_path))
-    if not rows:
-        raise ValueError("Convergence semantic validation requires generated pairs")
-    for row in rows:
-        if not isinstance(row.get("source"), str) or not isinstance(row.get("target"), str):
-            raise ValueError("Convergence semantic rows require source and target strings")
-
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    model_path = snapshot_download(model_name, revision=model_revision)
-    model = SentenceTransformer(model_path, device=device)
-    source_embeddings = model.encode(
-        [str(row["source"]) for row in rows],
-        normalize_embeddings=True,
-    )
-    target_embeddings = model.encode(
-        [str(row["target"]) for row in rows],
-        normalize_embeddings=True,
-    )
-    semantic_embeddings = model.encode(
-        [_semantic_reference(row) for row in rows],
-        normalize_embeddings=True,
-    )
-    target_similarities = np.sum(source_embeddings * target_embeddings, axis=1)
-    semantic_similarities = np.sum(source_embeddings * semantic_embeddings, axis=1)
-    similarities = np.maximum(target_similarities, semantic_similarities)
-    validated = [
-        {**row, "semantic_similarity": float(score)}
-        for row, score in zip(rows, similarities, strict=True)
-    ]
-    write_jsonl(output_path, validated)
-    report = {
-        "schema_version": 1,
-        "task": "convergence_source_semantic_validation",
-        "model": model_name,
-        "model_revision": model_revision,
-        "device": device,
-        "examples": len(rows),
-        "minimum_required_similarity": minimum_similarity,
-        "reference_policy": "maximum_of_original_target_and_context_resolved_semantics",
-        "mean_similarity": float(similarities.mean()),
-        "mean_target_similarity": float(target_similarities.mean()),
-        "mean_context_resolved_semantic_similarity": float(semantic_similarities.mean()),
-        "minimum_similarity": float(similarities.min()),
-        "below_minimum": int((similarities < minimum_similarity).sum()),
-        "accepted_rows": int((similarities >= minimum_similarity).sum()),
-        "text_persisted_in_report": False,
-        "private_local_evaluation": True,
-    }
-    write_json(report_path, report)
-    return report
-
-
-def repair_with_qwen(
-    config_path: str | Path,
-    pairs_path: str | Path,
-    output_path: str | Path,
-    report_path: str | Path,
-    *,
-    limit: int,
-) -> dict[str, Any]:
-    from mlx_lm import generate, load
-
-    from imessage_mlx.data.repair import repair_low_signal_pairs
-
-    config = load_yaml(config_path)
-    model, tokenizer = load(_qwen_model_reference(config))
-
-    def local_generate(stage: str, payload: str) -> str:
-        messages = [{"role": "user", "content": payload}]
-        try:
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        except TypeError:
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        output = generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=384 if stage == "extract" else 128,
-            verbose=False,
-        ).strip()
-        if output.startswith("```"):
-            output = output.removeprefix("```json").removeprefix("```")
-            output = output.removesuffix("```").strip()
-        return output
-
-    report = repair_low_signal_pairs(
-        pairs_path,
-        output_path,
-        report_path,
-        generate=local_generate,
-        limit=limit,
-    )
-    report["local_model"] = str(config["base_model"])
-    report["local_model_revision"] = str(config["revision"])
-    write_json(report_path, report)
-    return report
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -633,37 +581,19 @@ def main() -> None:
         "predict-bart",
         "predict-seq2seq",
         "predict-qwen",
-        "semantic-eval",
-        "convergence-data-semantics",
-        "repair-qwen",
         "rewrite-bart",
         "rewrite-seq2seq",
         "rewrite-qwen",
     ):
         subparser = subparsers.add_parser(command)
+        subparser.add_argument("--config", required=True)
         if command.startswith("rewrite-"):
-            subparser.add_argument("--config", required=True)
             subparser.add_argument("--adapter", required=True)
             subparser.add_argument("--draft", required=True)
             continue
         subparser.add_argument("--output", required=True)
-        if command in {"semantic-eval", "convergence-data-semantics"}:
-            subparser.add_argument("--data", required=True)
-            if command == "convergence-data-semantics":
-                subparser.add_argument("--report", required=True)
-                subparser.add_argument("--minimum", type=float, default=0.70)
-            continue
-        if command == "repair-qwen":
-            subparser.add_argument("--config", required=True)
-            subparser.add_argument("--data", required=True)
-            subparser.add_argument("--report", required=True)
-            subparser.add_argument("--limit", required=True, type=int)
-            continue
-        subparser.add_argument("--config", required=True)
-        if command in {"train-bart", "train-seq2seq"}:
-            subparser.add_argument("--data", required=True)
-        else:
-            subparser.add_argument("--data", required=True)
+        subparser.add_argument("--data", required=True)
+        if command.startswith("predict-"):
             subparser.add_argument("--adapter", required=True)
     arguments = parser.parse_args()
     if arguments.command in {"rewrite-bart", "rewrite-seq2seq"}:
@@ -672,24 +602,7 @@ def main() -> None:
     if arguments.command == "rewrite-qwen":
         print(rewrite_qwen(arguments.config, arguments.adapter, arguments.draft))
         return
-    if arguments.command == "semantic-eval":
-        report = semantic_evaluation(arguments.data, arguments.output)
-    elif arguments.command == "convergence-data-semantics":
-        report = convergence_source_semantics(
-            arguments.data,
-            arguments.output,
-            arguments.report,
-            minimum_similarity=arguments.minimum,
-        )
-    elif arguments.command == "repair-qwen":
-        report = repair_with_qwen(
-            arguments.config,
-            arguments.data,
-            arguments.output,
-            arguments.report,
-            limit=arguments.limit,
-        )
-    elif arguments.command in {"train-bart", "train-seq2seq"}:
+    if arguments.command in {"train-bart", "train-seq2seq"}:
         report = train_seq2seq(arguments.config, arguments.data, arguments.output)
     elif arguments.command in {"predict-bart", "predict-seq2seq"}:
         report = predict_seq2seq(

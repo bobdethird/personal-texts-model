@@ -8,13 +8,6 @@ import mlx.core as mx
 import numpy as np
 
 from imessage_mlx.checkpoint import load_model
-from imessage_mlx.data.normalize import normalize_text
-from imessage_mlx.data.rewrite import (
-    STRUCTURAL_TOKEN_RE,
-)
-from imessage_mlx.data.rewrite import (
-    format_rewrite_prompt as _format_rewrite_prompt,
-)
 from imessage_mlx.tokenizer.train import load_tokenizer
 
 
@@ -26,17 +19,6 @@ def format_reply_prompt(other_message: str, history: list[tuple[str, str]] | Non
     lines.append(f"<|other|>{other_message}<|turn_end|>")
     lines.append("<|me|>")
     return "\n".join(lines)
-
-
-def format_rewrite_prompt(neutral_draft: str) -> str:
-    if not isinstance(neutral_draft, str):
-        raise TypeError("Rewrite draft must be a string")
-    normalized = normalize_text(neutral_draft)
-    if not normalized:
-        raise ValueError("Rewrite draft cannot be empty")
-    if STRUCTURAL_TOKEN_RE.search(normalized):
-        raise ValueError("Rewrite draft contains a reserved structural token")
-    return _format_rewrite_prompt(normalized)
 
 
 def _model_capabilities(directory: Path) -> set[str]:
@@ -57,23 +39,6 @@ def _load_reply_model(directory: Path):
     if "reply" not in _model_capabilities(directory):
         raise ValueError("Model artifact was not trained for reply generation")
     return load_model(directory), load_tokenizer(directory / "tokenizer")
-
-
-def _load_rewrite_model(directory: Path):
-    tokenizer = load_tokenizer(directory / "tokenizer")
-    required_tokens = (
-        "<|bos|>",
-        "<|eos|>",
-        "<|rewrite|>",
-        "<|draft|>",
-        "<|me|>",
-        "<|turn_end|>",
-    )
-    if any(tokenizer.token_to_id(token) is None for token in required_tokens):
-        raise ValueError("Model tokenizer does not support rewrite prompts")
-    if "rewrite" not in _model_capabilities(directory):
-        raise ValueError("Model artifact was not trained for rewrite generation")
-    return load_model(directory), tokenizer
 
 
 def _sample(
@@ -196,47 +161,6 @@ def generate_reply(
         prompt_ids,
         eos_ids=eos_ids,
         max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        repetition_penalty=repetition_penalty,
-        seed=seed,
-    )
-    return tokenizer.decode(generated, skip_special_tokens=True).strip()
-
-
-def generate_rewrite(
-    model_dir: str | Path,
-    neutral_draft: str,
-    *,
-    max_new_tokens: int = 64,
-    temperature: float = 0.0,
-    top_p: float = 0.8,
-    repetition_penalty: float = 1.1,
-    seed: int = 42,
-) -> str:
-    directory = Path(model_dir)
-    model, tokenizer = _load_rewrite_model(directory)
-    prompt_ids = tokenizer.encode(
-        format_rewrite_prompt(neutral_draft), add_special_tokens=False
-    ).ids
-    if len(prompt_ids) >= model.config.max_sequence_length:
-        raise ValueError(
-            f"Rewrite prompt requires {len(prompt_ids)} tokens, leaving no generation context "
-            f"in the model's {model.config.max_sequence_length}-token window"
-        )
-    eos_ids = {
-        token_id
-        for token_id in (
-            tokenizer.token_to_id("<|eos|>"),
-            tokenizer.token_to_id("<|turn_end|>"),
-        )
-        if token_id is not None
-    }
-    generated = generate_ids(
-        model,
-        prompt_ids,
-        eos_ids=eos_ids,
-        max_new_tokens=min(max_new_tokens, model.config.max_sequence_length - len(prompt_ids)),
         temperature=temperature,
         top_p=top_p,
         repetition_penalty=repetition_penalty,

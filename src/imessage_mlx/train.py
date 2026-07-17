@@ -19,14 +19,12 @@ from imessage_mlx.dataset import (
     batch_indices,
     load_tokens,
     materialize_batch,
-    materialize_masked_batch,
     window_count,
 )
 from imessage_mlx.model.config import ModelConfig
 from imessage_mlx.model.transformer import (
     TransformerLM,
     causal_lm_loss,
-    masked_causal_lm_loss,
     perplexity,
 )
 from imessage_mlx.tokenizer.train import load_tokenizer
@@ -50,7 +48,6 @@ def evaluate_loss(
     *,
     context_length: int,
     batch_size: int,
-    loss_mask: np.ndarray | None = None,
 ) -> float:
     model.eval()
     count = window_count(tokens, context_length)
@@ -60,26 +57,12 @@ def evaluate_loss(
     total_weight = 0.0
     for start in range(0, count, batch_size):
         indices = np.arange(start, min(count, start + batch_size))
-        if loss_mask is None:
-            inputs_np, targets_np = materialize_batch(tokens, indices, context_length)
-            loss = causal_lm_loss(model, mx.array(inputs_np), mx.array(targets_np))
-            batch_weight = float(len(indices))
-        else:
-            inputs_np, targets_np, mask_np = materialize_masked_batch(
-                tokens, loss_mask, indices, context_length
-            )
-            loss = masked_causal_lm_loss(
-                model,
-                mx.array(inputs_np),
-                mx.array(targets_np),
-                mx.array(mask_np),
-            )
-            batch_weight = float(mask_np.sum())
+        inputs_np, targets_np = materialize_batch(tokens, indices, context_length)
+        loss = causal_lm_loss(model, mx.array(inputs_np), mx.array(targets_np))
+        batch_weight = float(len(indices))
         mx.eval(loss)
         total_loss += float(loss.item()) * batch_weight
         total_weight += batch_weight
-    if not total_weight:
-        raise ValueError("Evaluation split contains no supervised target tokens")
     return total_loss / total_weight
 
 
@@ -104,14 +87,8 @@ def train_model(
     tokenizer_path = Path(tokenizer_dir)
     task = str(training_config.get("task", "reply"))
     objective = str(training_config.get("objective", "causal"))
-    expected_objectives = {"reply": "causal", "rewrite": "target_only"}
-    if task not in expected_objectives:
-        raise ValueError(f"Unsupported training task {task!r}")
-    if objective != expected_objectives[task]:
-        raise ValueError(
-            f"Training task {task!r} requires objective {expected_objectives[task]!r}, "
-            f"not {objective!r}"
-        )
+    if task != "reply" or objective != "causal":
+        raise ValueError("Training supports only the reply task with the causal objective")
     if resume_from is not None:
         checkpoint_tokenizer = Path(resume_from) / "tokenizer/tokenizer.json"
         supplied_tokenizer = tokenizer_path / "tokenizer.json"
@@ -142,33 +119,6 @@ def train_model(
     context_length = model_config.max_sequence_length
     train_tokens = load_tokens(data_path / "train.npy")
     validation_tokens = load_tokens(data_path / "validation.npy")
-    train_loss_mask = (
-        load_tokens(data_path / "train-loss-mask.npy") if objective == "target_only" else None
-    )
-    validation_loss_mask = (
-        load_tokens(data_path / "validation-loss-mask.npy") if objective == "target_only" else None
-    )
-    if train_loss_mask is not None and train_loss_mask.size != train_tokens.size:
-        raise ValueError("Training token and loss-mask arrays must have identical lengths")
-    if validation_loss_mask is not None and validation_loss_mask.size != validation_tokens.size:
-        raise ValueError("Validation token and loss-mask arrays must have identical lengths")
-    if objective == "target_only":
-        token_report_path = data_path / "token-counts.json"
-        if not token_report_path.exists():
-            raise ValueError("Target-only training requires rewrite token-count metadata")
-        token_report = json.loads(token_report_path.read_text(encoding="utf-8"))
-        for split_name, tokens in (
-            ("train", train_tokens),
-            ("validation", validation_tokens),
-        ):
-            encoded_context = int(token_report.get(split_name, {}).get("context_length", -1))
-            if encoded_context != context_length:
-                raise ValueError(
-                    f"Rewrite {split_name} data was encoded for context {encoded_context}, "
-                    f"not model context {context_length}"
-                )
-            if tokens.size % (context_length + 1):
-                raise ValueError(f"Rewrite {split_name} data does not contain complete blocks")
     train_count = window_count(train_tokens, context_length)
     if not train_count:
         raise ValueError(
@@ -191,13 +141,11 @@ def train_model(
         "batch_in_epoch": 0,
         "global_step": 0,
         "tokens_trained": 0,
-        "supervised_tokens_trained": 0,
         "best_validation_loss": math.inf,
         "evaluations_without_improvement": 0,
     }
     if resume_from is not None:
         state.update(restore_training_state(resume_from, model, optimizer))
-        state.setdefault("supervised_tokens_trained", 0)
 
     batch_size = int(training_config["batch_size"])
     epochs = int(training_config["epochs"])
@@ -212,36 +160,19 @@ def train_model(
     patience = int(training_config.get("early_stopping_patience", 5))
 
     compiled_state = [model.state, optimizer.state]
-    if objective == "target_only":
-        value_and_grad = nn.value_and_grad(model, masked_causal_lm_loss)
+    value_and_grad = nn.value_and_grad(model, causal_lm_loss)
 
-        def masked_step(
-            inputs: mx.array, targets: mx.array, loss_mask: mx.array
-        ) -> tuple[mx.array, mx.array]:
-            loss, gradients = value_and_grad(model, inputs, targets, loss_mask)
-            gradients, gradient_norm = optim.clip_grad_norm(gradients, gradient_clip)
-            optimizer.update(model, gradients)
-            return loss, gradient_norm
+    def causal_step(inputs: mx.array, targets: mx.array) -> tuple[mx.array, mx.array]:
+        loss, gradients = value_and_grad(model, inputs, targets)
+        gradients, gradient_norm = optim.clip_grad_norm(gradients, gradient_clip)
+        optimizer.update(model, gradients)
+        return loss, gradient_norm
 
-        train_step = (
-            partial(mx.compile, inputs=compiled_state, outputs=compiled_state)(masked_step)
-            if compile_step
-            else masked_step
-        )
-    else:
-        value_and_grad = nn.value_and_grad(model, causal_lm_loss)
-
-        def causal_step(inputs: mx.array, targets: mx.array) -> tuple[mx.array, mx.array]:
-            loss, gradients = value_and_grad(model, inputs, targets)
-            gradients, gradient_norm = optim.clip_grad_norm(gradients, gradient_clip)
-            optimizer.update(model, gradients)
-            return loss, gradient_norm
-
-        train_step = (
-            partial(mx.compile, inputs=compiled_state, outputs=compiled_state)(causal_step)
-            if compile_step
-            else causal_step
-        )
+    train_step = (
+        partial(mx.compile, inputs=compiled_state, outputs=compiled_state)(causal_step)
+        if compile_step
+        else causal_step
+    )
     metrics_path = output / "metrics.jsonl"
     started = time.perf_counter()
     stop_early = False
@@ -287,24 +218,11 @@ def train_model(
                 int(state["global_step"]), total_steps, warmup_steps, peak_lr, minimum_lr
             )
             optimizer.learning_rate = mx.array(learning_rate)
-            if train_loss_mask is None:
-                inputs_np, targets_np = materialize_batch(train_tokens, indices, context_length)
-                loss, gradient_norm = train_step(mx.array(inputs_np), mx.array(targets_np))
-                supervised_tokens = int(targets_np.size)
-            else:
-                inputs_np, targets_np, mask_np = materialize_masked_batch(
-                    train_tokens, train_loss_mask, indices, context_length
-                )
-                loss, gradient_norm = train_step(
-                    mx.array(inputs_np), mx.array(targets_np), mx.array(mask_np)
-                )
-                supervised_tokens = int(mask_np.sum())
+            inputs_np, targets_np = materialize_batch(train_tokens, indices, context_length)
+            loss, gradient_norm = train_step(mx.array(inputs_np), mx.array(targets_np))
             mx.eval(loss, gradient_norm, model.parameters(), optimizer.state)
             state["global_step"] = int(state["global_step"]) + 1
             state["tokens_trained"] = int(state["tokens_trained"]) + int(targets_np.size)
-            state["supervised_tokens_trained"] = (
-                int(state["supervised_tokens_trained"]) + supervised_tokens
-            )
             state["epoch"] = epoch
             state["batch_in_epoch"] = batch_number + 1
             elapsed = max(time.perf_counter() - started, 1e-9)
@@ -330,7 +248,6 @@ def train_model(
                     validation_tokens,
                     context_length=context_length,
                     batch_size=batch_size,
-                    loss_mask=validation_loss_mask,
                 )
                 _append_metric(
                     metrics_path,
