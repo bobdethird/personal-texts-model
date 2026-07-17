@@ -184,6 +184,68 @@ def evaluate_prediction_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
     }
 
 
+def summarize_prediction_files(
+    named_paths: Mapping[str, str | Path],
+    output_path: str | Path,
+) -> dict[str, Any]:
+    """Score several prediction files on the shared test set and render one table."""
+    if not named_paths:
+        raise ValueError("Summary requires at least one prediction file")
+    summaries: dict[str, dict[str, Any]] = {}
+    expected_ids: set[str] | None = None
+    for name, path in named_paths.items():
+        rows = list(read_jsonl(path))
+        row_ids = {str(row["pair_id"]) for row in rows}
+        if expected_ids is None:
+            expected_ids = row_ids
+        elif row_ids != expected_ids:
+            raise ValueError(f"Prediction file {name!r} covers different pair IDs")
+        summaries[name] = evaluate_prediction_rows(rows)
+
+    header = ["metric", *summaries]
+    lines = ["| " + " | ".join(header) + " |", "| " + " | ".join("---" for _ in header) + " |"]
+    for metric in KEY_METRICS:
+        cells = [metric]
+        for name in summaries:
+            value = summaries[name][metric]
+            cells.append("n/a" if value is None else f"{value:.4f}")
+        lines.append("| " + " | ".join(cells) + " |")
+    report = {"models": summaries, "markdown_table": "\n".join(lines)}
+    write_json(output_path, report)
+    return report
+
+
+def create_predictions_review(
+    named_paths: Mapping[str, str | Path],
+    output_path: str | Path,
+    *,
+    sample_size: int = 50,
+) -> dict[str, Any]:
+    """Render a private side-by-side sample of every model's outputs for human review."""
+    import hashlib
+
+    models = {
+        name: {str(row["pair_id"]): row for row in read_jsonl(path)}
+        for name, path in named_paths.items()
+    }
+    first = next(iter(models.values()))
+    ordered = sorted(first, key=lambda pid: hashlib.sha256(pid.encode()).hexdigest())
+    chosen = ordered[:sample_size]
+    lines = ["# Rewrite model review sample", ""]
+    for pair_id in chosen:
+        row = first[pair_id]
+        lines.append(f"## {pair_id}")
+        lines.append(f"**Draft:** {row['neutral_text']}")
+        lines.append(f"**Gold:** {row['target_text']}")
+        for name, rows in models.items():
+            lines.append(f"- **{name}:** {rows[pair_id]['generated_text']}")
+        lines.append("")
+    path = Path(output_path)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    path.chmod(0o600)
+    return {"sampled": len(chosen), "models": list(models), "private_review": str(path)}
+
+
 def compare_prediction_files(
     baseline_path: str | Path,
     candidate_path: str | Path,
@@ -216,10 +278,28 @@ def compare_prediction_files(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--baseline", required=True)
-    parser.add_argument("--candidate", required=True)
+    parser.add_argument("--baseline")
+    parser.add_argument("--candidate")
+    parser.add_argument("--model", action="append", default=[], metavar="NAME=PREDICTIONS")
+    parser.add_argument("--review")
+    parser.add_argument("--review-samples", type=int, default=50)
     parser.add_argument("--output", required=True)
     arguments = parser.parse_args()
+    if arguments.model:
+        named = dict(entry.split("=", maxsplit=1) for entry in arguments.model)
+        report = summarize_prediction_files(named, arguments.output)
+        print(report["markdown_table"])
+        if arguments.review:
+            print(
+                create_predictions_review(
+                    named,
+                    arguments.review,
+                    sample_size=arguments.review_samples,
+                )
+            )
+        return
+    if not (arguments.baseline and arguments.candidate):
+        parser.error("Provide either --model entries or both --baseline and --candidate")
     print(compare_prediction_files(arguments.baseline, arguments.candidate, arguments.output))
 
 

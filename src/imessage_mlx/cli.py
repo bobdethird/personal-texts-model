@@ -377,10 +377,10 @@ def predict_adapter_command(
 def rewrite_adapter_command(
     neutral_draft: Annotated[str, typer.Argument(help="Neutral draft to rewrite")],
     config: Annotated[Path, typer.Option(help="Adapter configuration YAML")] = Path(
-        "configs/adapter-bart-base.yaml"
+        "configs/adapter-bart-base-v3.yaml"
     ),
     adapter: Annotated[Path, typer.Option(help="Private adapter run directory")] = Path(
-        "outputs/adapters/run"
+        "outputs/adapters/bart-llm-v3"
     ),
     environment: Annotated[Path, typer.Option(help="Isolated adapter environment")] = Path(
         "work/envs/bart"

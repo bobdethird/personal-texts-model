@@ -21,6 +21,9 @@ REWRITE_INSTRUCTION = (
     "question, negation, and degree of uncertainty. Return only the rewritten message.\n\nDraft:\n"
 )
 WORD_PATTERN = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?")
+# Short drafts legitimately collapse into initialisms ("What do you mean?" -> "wdym"),
+# so the candidate length floor only applies to sources long enough to drop content.
+LENGTH_FLOOR_MIN_SOURCE_WORDS = 5
 
 
 def normalized_words(text: str) -> list[str]:
@@ -58,7 +61,10 @@ def transformation_sampling_weights(
     minimum_ratio = float(options.get("strong_min_length_ratio", 0.65))
     maximum_ratio = float(options.get("strong_max_length_ratio", 1.2))
     require_numbers = bool(options.get("require_source_numbers", True))
-    if min(exact_weight, near_weight, strong_weight) <= 0:
+    deletion_ratio = float(options.get("severe_deletion_length_ratio", 0.5))
+    deletion_similarity = float(options.get("severe_deletion_similarity", 0.5))
+    deletion_weight = float(options.get("severe_deletion_weight", 1.0))
+    if min(exact_weight, near_weight, strong_weight, deletion_weight) <= 0:
         raise ValueError("Sampling weights must be positive")
     if not 0 <= strong_threshold <= near_threshold <= 1:
         raise ValueError("Sampling thresholds must satisfy 0 <= strong <= near <= 1")
@@ -81,6 +87,9 @@ def transformation_sampling_weights(
             category, weight = "exact_copy", exact_weight
         elif similarity >= near_threshold:
             category, weight = "near_copy", near_weight
+        elif length_ratio < deletion_ratio and similarity < deletion_similarity:
+            # Targets that silently drop most of the source teach length collapse.
+            category, weight = "severe_deletion", deletion_weight
         elif (
             similarity < strong_threshold
             and minimum_ratio <= length_ratio <= maximum_ratio
@@ -103,6 +112,89 @@ def transformation_sampling_weights(
             for category, weight in sorted(category_weight.items())
         },
     }
+
+
+def decoding_options(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve inference guardrail settings; defaults keep legacy greedy decoding."""
+    options = dict(config.get("decoding") or {})
+    resolved = {
+        "best_of": int(options.get("best_of", 1)),
+        "temperature": float(options.get("temperature", 0.8)),
+        "top_p": float(options.get("top_p", 0.9)),
+        "min_new_tokens_ratio": float(options.get("min_new_tokens_ratio", 0.0)),
+        "min_new_tokens_cap": int(options.get("min_new_tokens_cap", 24)),
+        "length_ratio_min": float(options.get("length_ratio_min", 0.3)),
+        "length_ratio_max": float(options.get("length_ratio_max", 1.6)),
+        "copy_escape_jaccard": float(options.get("copy_escape_jaccard", 1.0)),
+    }
+    if resolved["best_of"] < 1:
+        raise ValueError("decoding.best_of must be at least 1")
+    if resolved["min_new_tokens_ratio"] < 0:
+        raise ValueError("decoding.min_new_tokens_ratio cannot be negative")
+    if not 0 < resolved["length_ratio_min"] <= resolved["length_ratio_max"]:
+        raise ValueError("decoding length-ratio band is invalid")
+    return resolved
+
+
+def minimum_new_tokens(source_text: str, options: Mapping[str, Any]) -> int:
+    ratio = float(options["min_new_tokens_ratio"])
+    if ratio <= 0:
+        return 0
+    floor = round(ratio * len(normalized_words(source_text)))
+    return max(1, min(int(options["min_new_tokens_cap"]), floor))
+
+
+def select_rewrite_candidate(
+    source_text: str,
+    candidates: Sequence[str],
+    options: Mapping[str, Any],
+) -> str:
+    """Trust the greedy candidate unless it fails checks or copies the source.
+
+    Candidates that lose source numerals, flip negation polarity, or fall outside the
+    word-length band are rejected. The greedy candidate wins whenever it passes checks
+    and is not a near-copy; otherwise the escape picks the surviving alternative that
+    deviates least while still clearing the copy threshold, so a forced escape never
+    overshoots into a wild sample. The greedy candidate is the fallback when nothing
+    survives.
+    """
+    from imessage_mlx.adapter_evaluation import NEGATIONS, normalized_numbers
+
+    if not candidates:
+        raise ValueError("Candidate selection requires at least one candidate")
+    source_words = normalized_words(source_text)
+    source_numbers = normalized_numbers(source_text)
+    source_negated = any(word in NEGATIONS for word in source_words)
+    copy_threshold = float(options["copy_escape_jaccard"])
+
+    survivors: list[tuple[float, int, str]] = []
+    for index, candidate in enumerate(candidates):
+        words = normalized_words(candidate)
+        if not words:
+            continue
+        if source_words:
+            ratio = len(words) / len(source_words)
+            if ratio > options["length_ratio_max"]:
+                continue
+            if (
+                len(source_words) >= LENGTH_FLOOR_MIN_SOURCE_WORDS
+                and ratio < options["length_ratio_min"]
+            ):
+                continue
+        if source_numbers - normalized_numbers(candidate):
+            continue
+        if source_negated != any(word in NEGATIONS for word in words):
+            continue
+        survivors.append((multiset_jaccard(source_words, words), index, candidate))
+    if not survivors:
+        return candidates[0]
+    greedy_survivor = next((entry for entry in survivors if entry[1] == 0), None)
+    if greedy_survivor is not None and greedy_survivor[0] < copy_threshold:
+        return greedy_survivor[2]
+    transformed = [entry for entry in survivors if entry[0] < copy_threshold]
+    if transformed:
+        return max(transformed)[2]
+    return greedy_survivor[2] if greedy_survivor is not None else survivors[0][2]
 
 
 def _chmod_private_tree(root: Path) -> None:
@@ -180,17 +272,19 @@ def train_seq2seq(
     if not train_rows or not valid_rows:
         raise ValueError("Seq2seq length filtering removed every train or validation example")
     model = AutoModelForSeq2SeqLM.from_pretrained(base_model, revision=revision)
-    model = get_peft_model(
-        model,
-        LoraConfig(
-            task_type=TaskType.SEQ_2_SEQ_LM,
-            inference_mode=False,
-            r=int(config.get("lora_rank", 8)),
-            lora_alpha=int(config.get("lora_alpha", 16)),
-            lora_dropout=float(config.get("lora_dropout", 0.1)),
-            target_modules=list(profile.lora_target_modules),
-        ),
-    )
+    full_finetune = bool(config.get("full_finetune", False))
+    if not full_finetune:
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                task_type=TaskType.SEQ_2_SEQ_LM,
+                inference_mode=False,
+                r=int(config.get("lora_rank", 8)),
+                lora_alpha=int(config.get("lora_alpha", 16)),
+                lora_dropout=float(config.get("lora_dropout", 0.1)),
+                target_modules=list(profile.lora_target_modules),
+            ),
+        )
     model.to(device)
 
     class PairDataset(Dataset):
@@ -352,9 +446,10 @@ def train_seq2seq(
         "base_revision": revision,
         "base_model_license": profile.base_model_license,
         "source_prefix": profile.source_prefix,
-        "lora_target_modules": list(profile.lora_target_modules),
-        "lora_rank": int(config.get("lora_rank", 8)),
-        "lora_alpha": int(config.get("lora_alpha", 16)),
+        "full_finetune": full_finetune,
+        "lora_target_modules": None if full_finetune else list(profile.lora_target_modules),
+        "lora_rank": None if full_finetune else int(config.get("lora_rank", 8)),
+        "lora_alpha": None if full_finetune else int(config.get("lora_alpha", 16)),
         "trainable_parameters": trainable_parameters,
         "total_parameters": total_parameters,
         "trainable_parameter_fraction": trainable_parameters / total_parameters,
@@ -378,6 +473,41 @@ def train_seq2seq(
     return report
 
 
+def _generate_rewrite_candidates(
+    model,
+    tokenizer,
+    encoded: Mapping[str, Any],
+    source_text: str,
+    max_new_tokens: int,
+    options: Mapping[str, Any],
+) -> list[str]:
+    floor = minimum_new_tokens(source_text, options)
+    length_options = {"min_new_tokens": floor} if floor else {}
+    greedy = model.generate(
+        **encoded,
+        do_sample=False,
+        num_beams=1,
+        max_new_tokens=max_new_tokens,
+        **length_options,
+    )
+    candidates = [tokenizer.decode(greedy[0], skip_special_tokens=True).strip()]
+    sampled_count = int(options["best_of"]) - 1
+    if sampled_count > 0:
+        sampled = model.generate(
+            **encoded,
+            do_sample=True,
+            temperature=float(options["temperature"]),
+            top_p=float(options["top_p"]),
+            num_return_sequences=sampled_count,
+            max_new_tokens=max_new_tokens,
+            **length_options,
+        )
+        candidates.extend(
+            tokenizer.decode(sequence, skip_special_tokens=True).strip() for sequence in sampled
+        )
+    return candidates
+
+
 def predict_seq2seq(
     config_path: str | Path,
     data_path: str | Path,
@@ -390,13 +520,18 @@ def predict_seq2seq(
 
     config = load_yaml(config_path)
     profile = resolve_seq2seq_profile(config)
+    options = decoding_options(config)
+    torch.manual_seed(int(config.get("seed", 42)))
     device = _device(torch)
     base_model = str(config["base_model"])
     revision = str(config.get("revision", "main"))
     tokenizer_path = Path(adapter_dir) / "tokenizer"
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = AutoModelForSeq2SeqLM.from_pretrained(base_model, revision=revision)
-    model = PeftModel.from_pretrained(model, Path(adapter_dir) / "adapter")
+    if bool(config.get("full_finetune", False)):
+        model = AutoModelForSeq2SeqLM.from_pretrained(Path(adapter_dir) / "adapter")
+    else:
+        model = AutoModelForSeq2SeqLM.from_pretrained(base_model, revision=revision)
+        model = PeftModel.from_pretrained(model, Path(adapter_dir) / "adapter")
     model.to(device)
     model.eval()
     rows = list(read_jsonl(data_path))
@@ -412,12 +547,15 @@ def predict_seq2seq(
                     truncation=True,
                 )
                 encoded = {key: value.to(device) for key, value in encoded.items()}
-                generated = model.generate(
-                    **encoded,
-                    do_sample=False,
-                    num_beams=1,
-                    max_new_tokens=int(config.get("max_new_tokens", 64)),
+                candidates = _generate_rewrite_candidates(
+                    model,
+                    tokenizer,
+                    encoded,
+                    str(row["source"]),
+                    int(config.get("max_new_tokens", 64)),
+                    options,
                 )
+                selected = select_rewrite_candidate(str(row["source"]), candidates, options)
                 metadata = {
                     key: str(row[key])
                     for key in ("target_id", "variant_kind", "split", "source_pair_id")
@@ -442,9 +580,7 @@ def predict_seq2seq(
                     "pair_id": str(row["pair_id"]),
                     "neutral_text": str(row["source"]),
                     "target_text": str(row["target"]),
-                    "generated_text": tokenizer.decode(
-                        generated[0], skip_special_tokens=True
-                    ).strip(),
+                    "generated_text": selected,
                     **metadata,
                 }
 
@@ -458,6 +594,36 @@ def predict_seq2seq(
         "examples_per_second": count / max(elapsed, 1e-9),
         "output": str(Path(output_path)),
     }
+
+
+def _translategemma_prompt(tokenizer, draft: str, config: Mapping[str, Any]) -> str:
+    """Render TranslateGemma's mandatory structured translation template (en -> en)."""
+    content = [
+        {
+            "type": "text",
+            "source_lang_code": str(config.get("source_lang_code", "en")),
+            "target_lang_code": str(config.get("target_lang_code", "en")),
+            "text": draft,
+        }
+    ]
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": content}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    # generate() re-encodes with a BOS token, so drop the template's own.
+    return prompt.removeprefix("<bos>")
+
+
+def _mlx_generation_prompt(
+    tokenizer,
+    draft: str,
+    raw_prompt: str,
+    config: Mapping[str, Any],
+) -> str:
+    if str(config.get("chat_format", "")) == "translategemma":
+        return _translategemma_prompt(tokenizer, draft, config)
+    return raw_prompt
 
 
 def predict_qwen(
@@ -474,11 +640,12 @@ def predict_qwen(
     started = time.perf_counter()
 
     def predictions():
-        for row in rows:
+        for index, row in enumerate(rows, start=1):
+            draft = str(row["prompt"]).rsplit("Draft:\n", maxsplit=1)[-1]
             output = generate(
                 model,
                 tokenizer,
-                prompt=str(row["prompt"]),
+                prompt=_mlx_generation_prompt(tokenizer, draft, str(row["prompt"]), config),
                 max_tokens=int(config.get("max_new_tokens", 64)),
                 verbose=False,
             )
@@ -487,15 +654,31 @@ def predict_qwen(
                 for key in ("target_id", "variant_kind", "split", "source_pair_id")
                 if key in row
             }
+            if index % 10 == 0 or index == len(rows):
+                elapsed = max(time.perf_counter() - started, 0.001)
+                rate = index / elapsed
+                eta_minutes = (len(rows) - index) / rate / 60
+                fraction = index / len(rows) if rows else 1.0
+                width = 30
+                filled = min(width, int(width * fraction))
+                bar = "#" * filled + "-" * (width - filled)
+                print(
+                    f"\r[{bar}] {index}/{len(rows)} ({fraction:6.2%}) "
+                    f"{rate:.2f} examples/s ETA {eta_minutes:.1f}m",
+                    end="",
+                    file=sys.stderr,
+                    flush=True,
+                )
             yield {
                 "pair_id": str(row["pair_id"]),
-                "neutral_text": str(row["prompt"]).rsplit("Draft:\n", maxsplit=1)[-1],
+                "neutral_text": draft,
                 "target_text": str(row["completion"]),
-                "generated_text": output.strip(),
+                "generated_text": output.split("<end_of_turn>")[0].strip(),
                 **metadata,
             }
 
     count = write_jsonl(output_path, predictions())
+    print(file=sys.stderr)
     elapsed = time.perf_counter() - started
     return {
         "architecture": "qwen",
@@ -517,14 +700,19 @@ def rewrite_seq2seq(
 
     config = load_yaml(config_path)
     profile = resolve_seq2seq_profile(config)
+    options = decoding_options(config)
+    torch.manual_seed(int(config.get("seed", 42)))
     device = _device(torch)
     run = Path(adapter_dir)
     tokenizer = AutoTokenizer.from_pretrained(run / "tokenizer")
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        str(config["base_model"]),
-        revision=str(config.get("revision", "main")),
-    )
-    model = PeftModel.from_pretrained(model, run / "adapter")
+    if bool(config.get("full_finetune", False)):
+        model = AutoModelForSeq2SeqLM.from_pretrained(run / "adapter")
+    else:
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            str(config["base_model"]),
+            revision=str(config.get("revision", "main")),
+        )
+        model = PeftModel.from_pretrained(model, run / "adapter")
     model.to(device)
     model.eval()
     encoded = tokenizer(
@@ -535,13 +723,216 @@ def rewrite_seq2seq(
     )
     encoded = {key: value.to(device) for key, value in encoded.items()}
     with torch.no_grad():
-        generated = model.generate(
-            **encoded,
-            do_sample=False,
-            num_beams=1,
-            max_new_tokens=int(config.get("max_new_tokens", 64)),
+        candidates = _generate_rewrite_candidates(
+            model,
+            tokenizer,
+            encoded,
+            draft,
+            int(config.get("max_new_tokens", 64)),
+            options,
         )
-    return tokenizer.decode(generated[0], skip_special_tokens=True).strip()
+    return select_rewrite_candidate(draft, candidates, options)
+
+
+def train_dpo_seq2seq(
+    config_path: str | Path,
+    data_dir: str | Path,
+    adapter_dir: str | Path,
+    output_dir: str | Path,
+) -> dict[str, Any]:
+    """Direct preference optimization for the seq2seq LoRA adapter.
+
+    The frozen SFT adapter provides reference log-probabilities (precomputed, since the
+    policy only drifts after optimization starts), then the LoRA weights are trained to
+    widen the chosen-vs-rejected margin relative to that reference. Implemented locally
+    because current TRL releases dropped encoder-decoder DPO support.
+    """
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+    config = load_yaml(config_path)
+    profile = resolve_seq2seq_profile(config)
+    options = dict(config.get("dpo") or {})
+    beta = float(options.get("beta", 0.1))
+    learning_rate = float(options.get("learning_rate", 5e-6))
+    epochs = int(options.get("epochs", 1))
+    batch_size = int(options.get("batch_size", 2))
+    accumulation = int(options.get("gradient_accumulation_steps", 8))
+    max_length = int(config.get("max_length", 256))
+    seed = int(config.get("seed", 42))
+    if beta <= 0 or learning_rate <= 0 or epochs <= 0 or batch_size <= 0 or accumulation <= 0:
+        raise ValueError("DPO settings must be positive")
+    torch.manual_seed(seed)
+    random.seed(seed)
+    device = _device(torch)
+
+    train_rows = list(read_jsonl(Path(data_dir) / "train.jsonl"))
+    valid_rows = list(read_jsonl(Path(data_dir) / "valid.jsonl"))
+    if not train_rows or not valid_rows:
+        raise ValueError("DPO requires non-empty preference train and valid JSONL")
+
+    output = ensure_private_dir(output_dir)
+    run = Path(adapter_dir)
+    tokenizer = AutoTokenizer.from_pretrained(run / "tokenizer")
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        str(config["base_model"]),
+        revision=str(config.get("revision", "main")),
+    )
+    model = PeftModel.from_pretrained(model, run / "adapter", is_trainable=True)
+    model.to(device)
+
+    pad_id = int(tokenizer.pad_token_id)
+
+    def encode_batch(rows: Sequence[Mapping[str, Any]]):
+        sources, labels = [], []
+        for row in rows:
+            for key in ("chosen", "rejected"):
+                sources.append(format_seq2seq_source(str(row["draft"]), profile))
+                labels.append(str(row[key]))
+        encoded = tokenizer(
+            sources,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        targets = tokenizer(
+            text_target=labels,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )["input_ids"]
+        targets[targets == pad_id] = -100
+        return {key: value.to(device) for key, value in encoded.items()}, targets.to(device)
+
+    def sequence_log_probs(rows: Sequence[Mapping[str, Any]]):
+        encoded, targets = encode_batch(rows)
+        logits = model(**encoded, labels=targets).logits
+        log_probs = torch.log_softmax(logits, dim=-1)
+        mask = targets != -100
+        gathered = torch.gather(
+            log_probs,
+            dim=-1,
+            index=targets.clamp(min=0).unsqueeze(-1),
+        ).squeeze(-1)
+        totals = (gathered * mask).sum(dim=-1)
+        return totals[0::2], totals[1::2]
+
+    def reference_margins(rows: Sequence[Mapping[str, Any]]):
+        margins = []
+        model.eval()
+        with torch.no_grad():
+            for start in range(0, len(rows), batch_size):
+                chosen, rejected = sequence_log_probs(rows[start : start + batch_size])
+                margins.extend((chosen - rejected).tolist())
+        return margins
+
+    started = time.perf_counter()
+    print("precomputing reference margins...", file=sys.stderr, flush=True)
+    train_reference = reference_margins(train_rows)
+    valid_reference = reference_margins(valid_rows)
+
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=learning_rate)
+
+    def validation_stats() -> tuple[float, float]:
+        model.eval()
+        margins = []
+        with torch.no_grad():
+            for start in range(0, len(valid_rows), batch_size):
+                chosen, rejected = sequence_log_probs(valid_rows[start : start + batch_size])
+                for offset, margin in enumerate((chosen - rejected).tolist()):
+                    margins.append(margin - valid_reference[start + offset])
+        wins = sum(margin > 0 for margin in margins)
+        return sum(margins) / len(margins), wins / len(margins)
+
+    history: list[dict[str, Any]] = []
+    best_margin = -math.inf
+    order = list(range(len(train_rows)))
+    total_batches = math.ceil(len(order) / batch_size) * epochs
+    completed_batches = 0
+    for epoch in range(epochs):
+        model.train()
+        random.shuffle(order)
+        optimizer.zero_grad(set_to_none=True)
+        epoch_loss = 0.0
+        batch_starts = range(0, len(order), batch_size)
+        for batch_index, start in enumerate(batch_starts):
+            indices = order[start : start + batch_size]
+            rows = [train_rows[index] for index in indices]
+            chosen, rejected = sequence_log_probs(rows)
+            reference = torch.tensor(
+                [train_reference[index] for index in indices],
+                device=chosen.device,
+            )
+            loss = -torch.nn.functional.logsigmoid(
+                beta * ((chosen - rejected) - reference)
+            ).mean()
+            (loss / accumulation).backward()
+            epoch_loss += float(loss.item())
+            if (batch_index + 1) % accumulation == 0 or batch_index + 1 == len(batch_starts):
+                torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            completed_batches += 1
+            if completed_batches % 10 == 0 or batch_index + 1 == len(batch_starts):
+                elapsed = max(time.perf_counter() - started, 0.001)
+                rate = completed_batches / elapsed
+                eta_minutes = (total_batches - completed_batches) / rate / 60
+                fraction = completed_batches / total_batches
+                width = 30
+                filled = min(width, int(width * fraction))
+                bar = "#" * filled + "-" * (width - filled)
+                print(
+                    f"\r[{bar}] dpo epoch {epoch + 1}/{epochs} "
+                    f"batch {batch_index + 1}/{len(batch_starts)} "
+                    f"loss {epoch_loss / (batch_index + 1):.4f} "
+                    f"{rate:.2f} batch/s ETA {eta_minutes:.1f}m",
+                    end="",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        mean_margin, accuracy = validation_stats()
+        history.append(
+            {
+                "epoch": epoch + 1,
+                "training_loss": epoch_loss / max(1, len(batch_starts)),
+                "validation_margin": mean_margin,
+                "validation_preference_accuracy": accuracy,
+            }
+        )
+        print(
+            f"\ndpo epoch {epoch + 1}: margin={mean_margin:.4f} accuracy={accuracy:.4f}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if mean_margin > best_margin:
+            best_margin = mean_margin
+            model.save_pretrained(output / "adapter", safe_serialization=True)
+            tokenizer.save_pretrained(output / "tokenizer")
+            _chmod_private_tree(output)
+
+    report = {
+        "schema_version": 1,
+        "task": "seq2seq_dpo",
+        "architecture": profile.architecture,
+        "base_model": str(config["base_model"]),
+        "base_revision": str(config.get("revision", "main")),
+        "sft_adapter": str(run),
+        "beta": beta,
+        "learning_rate": learning_rate,
+        "epochs": epochs,
+        "preference_pairs": {"train": len(train_rows), "valid": len(valid_rows)},
+        "best_validation_margin": best_margin,
+        "history": history,
+        "elapsed_seconds": time.perf_counter() - started,
+        "private_local_artifact": True,
+    }
+    write_json(output / "training-report.json", report)
+    _chmod_private_tree(output)
+    return report
 
 
 train_bart = train_seq2seq
@@ -562,14 +953,16 @@ def rewrite_qwen(
         _qwen_model_reference(config),
         adapter_path=str(Path(adapter_dir) / "adapter"),
     )
-    return generate(
+    prompt = _mlx_generation_prompt(tokenizer, draft, f"{REWRITE_INSTRUCTION}{draft}", config)
+    output = generate(
         model,
         tokenizer,
-        prompt=f"{REWRITE_INSTRUCTION}{draft}",
+        prompt=prompt,
         max_tokens=int(config.get("max_new_tokens", 64)),
         sampler=make_sampler(temp=0.0),
         verbose=False,
-    ).strip()
+    )
+    return output.split("<end_of_turn>")[0].strip()
 
 
 def main() -> None:
@@ -578,6 +971,8 @@ def main() -> None:
     for command in (
         "train-bart",
         "train-seq2seq",
+        "train-dpo-bart",
+        "train-dpo-seq2seq",
         "predict-bart",
         "predict-seq2seq",
         "predict-qwen",
@@ -593,7 +988,7 @@ def main() -> None:
             continue
         subparser.add_argument("--output", required=True)
         subparser.add_argument("--data", required=True)
-        if command.startswith("predict-"):
+        if command.startswith("predict-") or command.startswith("train-dpo-"):
             subparser.add_argument("--adapter", required=True)
     arguments = parser.parse_args()
     if arguments.command in {"rewrite-bart", "rewrite-seq2seq"}:
@@ -604,6 +999,13 @@ def main() -> None:
         return
     if arguments.command in {"train-bart", "train-seq2seq"}:
         report = train_seq2seq(arguments.config, arguments.data, arguments.output)
+    elif arguments.command in {"train-dpo-bart", "train-dpo-seq2seq"}:
+        report = train_dpo_seq2seq(
+            arguments.config,
+            arguments.data,
+            arguments.adapter,
+            arguments.output,
+        )
     elif arguments.command in {"predict-bart", "predict-seq2seq"}:
         report = predict_seq2seq(
             arguments.config,

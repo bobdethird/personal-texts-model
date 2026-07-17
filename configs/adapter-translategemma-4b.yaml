@@ -1,0 +1,24 @@
+name: translategemma-4b-qlora
+architecture: qwen
+base_model: mlx-community/translategemma-4b-it-4bit
+revision: 5788ec08c047f3f2e17808101b8d9566ac930d58
+base_model_license: gemma-terms-of-use
+# TranslateGemma's chat template requires structured translation content, so this lane
+# trains on the chat-format dataset built at work/llm/censored/trainsafe-gemma/mlx
+# (en -> en "translation" framing) instead of the generic prompt/completion files.
+chat_format: translategemma
+source_lang_code: en
+target_lang_code: en
+max_length: 256
+max_new_tokens: 96
+batch_size: 2
+gradient_accumulation_steps: 4
+iterations: 12000
+learning_rate: 0.0001
+num_layers: 16
+lora_rank: 8
+lora_scale: 20.0
+lora_dropout: 0.05
+validation_interval: 500
+save_interval: 500
+seed: 42

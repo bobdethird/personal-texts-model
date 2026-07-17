@@ -335,9 +335,20 @@ uv run imessage-mlx review-censor
 
 ### Local adapter training
 
-The recommended rewrite model is a locally trained `facebook/bart-base` seq2seq LoRA adapter. On
-the 24 GB M4 balanced benchmark, BART used about 3.05 GB peak memory and processed about 6.7
-examples/second after sustained load. Compact challengers (`google/flan-t5-small`,
+The recommended rewrite model is the v3 `facebook/bart-base` seq2seq LoRA adapter
+(`configs/adapter-bart-base-v3.yaml`): rank 32 over the attention and feed-forward projections,
+an explicit `personal rewrite:` source prefix, transformation-aware weighted sampling (near-copy
+targets downweighted, quality-gated strong rewrites upweighted, severe-deletion targets
+suppressed), and guardrailed decoding. Inference generates several candidates, rejects any that
+lose source numerals, flip negation, or collapse in length, and escapes verbatim copies with the
+closest surviving alternative. On the fixed 1,200-row held-out set this reached 58.9% target
+word-overlap with 0.8% exact copies, 98.3% numeral retention, and 99.6% negation agreement.
+
+Larger models are not automatically better here: a TranslateGemma-4B QLoRA
+(`configs/adapter-translategemma-4b.yaml`, MLX lane) only matched v2-level quality with more
+copying, and a DPO pass over v3's own failures collapsed output quality (emoji spam,
+hallucinated placeholders) despite 90%+ preference accuracy — both are kept for reference under
+`work/llm/evaluation/`, not promoted. Compact challengers (`google/flan-t5-small`,
 `Helsinki-NLP/opus-mt-gem-gem`) and a Qwen3-0.6B QLoRA spike can train on the same dataset root
 with their pinned configs. The configs pin exact model revisions; the `facebook/bart-base` model
 card does not declare a license, so treat base and adapter artifacts as local-only.
@@ -346,21 +357,26 @@ card does not declare a license, so treat base and adapter artifacts as local-on
 uv run imessage-mlx setup-adapter-environment bart --output work/envs/bart
 
 uv run imessage-mlx train-adapter \
-  --config configs/adapter-bart-base.yaml \
+  --config configs/adapter-bart-base-v3.yaml \
   --environment work/envs/bart \
-  --data work/llm/run/dataset \
-  --output outputs/adapters/bart-llm
+  --data work/llm/censored/trainsafe \
+  --output outputs/adapters/bart-llm-v3
 
 uv run imessage-mlx predict-adapter \
-  --config configs/adapter-bart-base.yaml \
+  --config configs/adapter-bart-base-v3.yaml \
   --environment work/envs/bart \
   --data work/llm/run/dataset \
-  --adapter outputs/adapters/bart-llm \
-  --output work/llm/evaluation/bart-llm.jsonl
+  --adapter outputs/adapters/bart-llm-v3 \
+  --output work/llm/evaluation/bart-llm-v3.jsonl
 
 uv run imessage-mlx rewrite-adapter "I will be there at seven." \
-  --adapter outputs/adapters/bart-llm
+  --adapter outputs/adapters/bart-llm-v3
 ```
+
+Model quality is compared with `python -m imessage_mlx.adapter_evaluation` (multi-model summary
+tables, side-by-side review samples) and preference data for experimental DPO runs is built with
+`python -m imessage_mlx.preference_data`; see `work/llm/evaluation/model-summary.json` and
+`model-review.md` for the current standings.
 
 There is no automated promotion gate. Read the held-out predictions yourself before using an
 adapter, and review every rewrite before sending it; no command sends messages automatically.
