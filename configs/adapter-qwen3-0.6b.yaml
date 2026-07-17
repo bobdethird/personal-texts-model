@@ -1,0 +1,17 @@
+name: qwen3-0.6b-qlora
+architecture: qwen
+base_model: mlx-community/Qwen3-0.6B-4bit
+revision: 73e3e38d981303bc594367cd910ea6eb48349da8
+max_length: 256
+max_new_tokens: 64
+batch_size: 1
+gradient_accumulation_steps: 8
+iterations: 1200
+learning_rate: 0.0001
+num_layers: 16
+lora_rank: 8
+lora_scale: 20.0
+lora_dropout: 0.05
+validation_interval: 100
+save_interval: 100
+seed: 42

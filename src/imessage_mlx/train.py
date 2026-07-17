@@ -15,11 +15,20 @@ import numpy as np
 
 from imessage_mlx import __version__
 from imessage_mlx.checkpoint import restore_training_state, save_checkpoint
-from imessage_mlx.dataset import batch_indices, load_tokens, materialize_batch, window_count
+from imessage_mlx.dataset import (
+    batch_indices,
+    load_tokens,
+    materialize_batch,
+    window_count,
+)
 from imessage_mlx.model.config import ModelConfig
-from imessage_mlx.model.transformer import TransformerLM, causal_lm_loss, perplexity
+from imessage_mlx.model.transformer import (
+    TransformerLM,
+    causal_lm_loss,
+    perplexity,
+)
 from imessage_mlx.tokenizer.train import load_tokenizer
-from imessage_mlx.utils import ensure_private_dir, write_json
+from imessage_mlx.utils import ensure_private_dir, sha256_file, write_json
 
 
 def learning_rate_at_step(
@@ -45,15 +54,16 @@ def evaluate_loss(
     if not count:
         raise ValueError("Evaluation split has no complete context window")
     total_loss = 0.0
-    total_examples = 0
+    total_weight = 0.0
     for start in range(0, count, batch_size):
         indices = np.arange(start, min(count, start + batch_size))
         inputs_np, targets_np = materialize_batch(tokens, indices, context_length)
         loss = causal_lm_loss(model, mx.array(inputs_np), mx.array(targets_np))
+        batch_weight = float(len(indices))
         mx.eval(loss)
-        total_loss += float(loss.item()) * len(indices)
-        total_examples += len(indices)
-    return total_loss / total_examples
+        total_loss += float(loss.item()) * batch_weight
+        total_weight += batch_weight
+    return total_loss / total_weight
 
 
 def _append_metric(path: Path, metric: dict[str, Any]) -> None:
@@ -74,11 +84,38 @@ def train_model(
 ) -> dict[str, Any]:
     output = ensure_private_dir(output_dir)
     data_path = Path(data_dir)
+    tokenizer_path = Path(tokenizer_dir)
+    task = str(training_config.get("task", "reply"))
+    objective = str(training_config.get("objective", "causal"))
+    if task != "reply" or objective != "causal":
+        raise ValueError("Training supports only the reply task with the causal objective")
+    if resume_from is not None:
+        checkpoint_tokenizer = Path(resume_from) / "tokenizer/tokenizer.json"
+        supplied_tokenizer = tokenizer_path / "tokenizer.json"
+        if not checkpoint_tokenizer.exists() or not supplied_tokenizer.exists():
+            raise ValueError("Cannot verify tokenizer compatibility for checkpoint resume")
+        if sha256_file(checkpoint_tokenizer) != sha256_file(supplied_tokenizer):
+            raise ValueError("Cannot resume with a tokenizer that differs from the checkpoint")
+        checkpoint_training_path = Path(resume_from) / "training-config.json"
+        if not checkpoint_training_path.exists():
+            raise ValueError("Cannot verify training configuration for checkpoint resume")
+        checkpoint_training = json.loads(checkpoint_training_path.read_text(encoding="utf-8"))
+        checkpoint_task = str(checkpoint_training.get("task", "reply"))
+        checkpoint_objective = str(checkpoint_training.get("objective", "causal"))
+        if (checkpoint_task, checkpoint_objective) != (task, objective):
+            raise ValueError("Cannot change task or objective when resuming a checkpoint")
     tokenizer = load_tokenizer(tokenizer_dir)
     actual_vocab_size = tokenizer.get_vocab_size()
     config_value = dict(training_config)
     config_value["vocab_size"] = actual_vocab_size
     model_config = ModelConfig.from_dict(config_value)
+    if resume_from is not None:
+        checkpoint_model_path = Path(resume_from) / "model-config.json"
+        if not checkpoint_model_path.exists():
+            raise ValueError("Cannot verify model configuration for checkpoint resume")
+        checkpoint_model = json.loads(checkpoint_model_path.read_text(encoding="utf-8"))
+        if checkpoint_model != model_config.to_dict():
+            raise ValueError("Cannot change model configuration when resuming a checkpoint")
     context_length = model_config.max_sequence_length
     train_tokens = load_tokens(data_path / "train.npy")
     validation_tokens = load_tokens(data_path / "validation.npy")
@@ -122,19 +159,19 @@ def train_model(
     checkpoint_interval = int(training_config.get("checkpoint_interval", 500))
     patience = int(training_config.get("early_stopping_patience", 5))
 
-    value_and_grad = nn.value_and_grad(model, causal_lm_loss)
     compiled_state = [model.state, optimizer.state]
+    value_and_grad = nn.value_and_grad(model, causal_lm_loss)
 
-    def step(inputs: mx.array, targets: mx.array) -> tuple[mx.array, mx.array]:
+    def causal_step(inputs: mx.array, targets: mx.array) -> tuple[mx.array, mx.array]:
         loss, gradients = value_and_grad(model, inputs, targets)
         gradients, gradient_norm = optim.clip_grad_norm(gradients, gradient_clip)
         optimizer.update(model, gradients)
         return loss, gradient_norm
 
     train_step = (
-        partial(mx.compile, inputs=compiled_state, outputs=compiled_state)(step)
+        partial(mx.compile, inputs=compiled_state, outputs=compiled_state)(causal_step)
         if compile_step
-        else step
+        else causal_step
     )
     metrics_path = output / "metrics.jsonl"
     started = time.perf_counter()
@@ -248,6 +285,7 @@ def train_model(
         "train_windows": train_count,
         "context_length": context_length,
         "actual_vocab_size": actual_vocab_size,
+        "objective": objective,
         "early_stopped": stop_early,
         "initialized_from_checkpoint": resume_from is not None,
         "pretrained_weights_used": False,

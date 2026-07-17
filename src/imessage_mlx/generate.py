@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -18,6 +19,26 @@ def format_reply_prompt(other_message: str, history: list[tuple[str, str]] | Non
     lines.append(f"<|other|>{other_message}<|turn_end|>")
     lines.append("<|me|>")
     return "\n".join(lines)
+
+
+def _model_capabilities(directory: Path) -> set[str]:
+    manifest_path = directory / "data-manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        capabilities = manifest.get("capabilities")
+        if isinstance(capabilities, list):
+            return {str(value) for value in capabilities}
+    training_config_path = directory / "training-config.json"
+    if training_config_path.exists():
+        config = json.loads(training_config_path.read_text(encoding="utf-8"))
+        return {str(config.get("task", "reply"))}
+    return {"reply"}
+
+
+def _load_reply_model(directory: Path):
+    if "reply" not in _model_capabilities(directory):
+        raise ValueError("Model artifact was not trained for reply generation")
+    return load_model(directory), load_tokenizer(directory / "tokenizer")
 
 
 def _sample(
@@ -124,8 +145,7 @@ def generate_reply(
     seed: int = 42,
 ) -> str:
     directory = Path(model_dir)
-    model = load_model(directory)
-    tokenizer = load_tokenizer(directory / "tokenizer")
+    model, tokenizer = _load_reply_model(directory)
     prompt = format_reply_prompt(other_message, history)
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False).ids
     eos_ids = {
@@ -161,8 +181,7 @@ def stream_reply(
     seed: int = 42,
 ) -> Iterator[str]:
     directory = Path(model_dir)
-    model = load_model(directory)
-    tokenizer = load_tokenizer(directory / "tokenizer")
+    model, tokenizer = _load_reply_model(directory)
     prompt_ids = tokenizer.encode(
         format_reply_prompt(other_message, history), add_special_tokens=False
     ).ids

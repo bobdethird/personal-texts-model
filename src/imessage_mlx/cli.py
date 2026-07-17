@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -9,15 +11,25 @@ from typing import Annotated
 
 import mlx.core as mx
 import typer
+from dotenv import load_dotenv
 
+from imessage_mlx.adapter_runtime import (
+    predict_adapter,
+    rewrite_with_adapter,
+    setup_adapter_environment,
+    train_adapter,
+)
 from imessage_mlx.audit import completion_audit
 from imessage_mlx.config import load_yaml, resolve_path
+from imessage_mlx.data.censor import censor_llm_dataset, create_censor_review
 from imessage_mlx.data.extract import extract_messages
 from imessage_mlx.data.inspect_schema import inspect_schema
+from imessage_mlx.data.llm_dataset import build_llm_dataset, create_llm_dataset_review
 from imessage_mlx.data.privacy_audit import audit_extracted_messages
 from imessage_mlx.data.sessions import build_sessions
 from imessage_mlx.data.snapshot import can_open_readonly, create_snapshot
 from imessage_mlx.data.split import split_sessions
+from imessage_mlx.data.table_export import export_messages_csv
 from imessage_mlx.dataset import encode_all_splits, select_model
 from imessage_mlx.evaluate import evaluate_checkpoint
 from imessage_mlx.export import export_model
@@ -34,6 +46,14 @@ app = typer.Typer(
 
 def _emit(value) -> None:
     typer.echo(json.dumps(value, indent=2, sort_keys=True))
+
+
+def _require_api_key() -> str:
+    load_dotenv()
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise typer.BadParameter("Set OPENAI_API_KEY in the environment or ignored .env file")
+    return api_key
 
 
 @app.command()
@@ -137,6 +157,7 @@ def prepare_command(
         redaction=settings.get("redaction", {}),
         include_attachment_marker=bool(settings.get("include_attachment_marker", True)),
         minimum_body_recovery_rate=float(settings.get("minimum_body_recovery_rate", 0.90)),
+        include_contact_names=bool(settings.get("include_contact_names", False)),
     )
     sessions = build_sessions(
         work / "extracted/messages.jsonl",
@@ -156,6 +177,225 @@ def prepare_command(
         guard_days=int(split_settings.get("guard_days", 7)),
     )
     _emit({"extraction": extraction, "sessions": sessions, "split": split_report})
+
+
+@app.command("build-llm-dataset")
+def build_llm_dataset_command(
+    messages: Annotated[Path, typer.Option(help="Private extracted message JSONL")] = Path(
+        "work/extracted/messages.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Private dataset run directory")] = Path(
+        "work/llm/run"
+    ),
+    model: Annotated[str | None, typer.Option(help="OpenAI model ID")] = None,
+    judge_model: Annotated[
+        str | None, typer.Option(help="OpenAI judge model ID; defaults to the proposal model")
+    ] = None,
+    max_window_messages: Annotated[int, typer.Option(min=2, max=400)] = 40,
+    limit_windows: Annotated[
+        int | None, typer.Option(min=1, help="Pilot on a deterministic window sample")
+    ] = None,
+    concurrency: Annotated[int, typer.Option(min=1, max=20)] = 4,
+    max_attempts: Annotated[int, typer.Option(min=1, max=5)] = 3,
+) -> None:
+    """Generate judge-screened rewrite pairs with hosted model decisions only."""
+    api_key = _require_api_key()
+    model_name = model or os.environ.get("OPENAI_MODEL", "gpt-5.5")
+    report = asyncio.run(
+        build_llm_dataset(
+            resolve_path(messages),
+            resolve_path(output),
+            api_key=api_key,
+            model=model_name,
+            judge_model=judge_model,
+            max_window_messages=max_window_messages,
+            limit_windows=limit_windows,
+            concurrency=concurrency,
+            max_attempts=max_attempts,
+        )
+    )
+    _emit(report)
+    if report["windows"]["proposal_failed"] or report["windows"]["judge_failed"]:
+        raise typer.Exit(code=1)
+
+
+@app.command("censor-llm-dataset")
+def censor_llm_dataset_command(
+    results: Annotated[Path, typer.Option(help="Private dataset run results JSONL")] = Path(
+        "work/llm/run/results.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Private dataset run directory")] = Path(
+        "work/llm/run"
+    ),
+    model: Annotated[str | None, typer.Option(help="OpenAI censor model ID")] = None,
+    batch_size: Annotated[int, typer.Option(min=1, max=50)] = 20,
+    concurrency: Annotated[int, typer.Option(min=1, max=20)] = 4,
+    max_attempts: Annotated[int, typer.Option(min=1, max=5)] = 3,
+    valid_fraction: Annotated[float, typer.Option(min=0.0, max=0.4)] = 0.05,
+    test_fraction: Annotated[float, typer.Option(min=0.0, max=0.4)] = 0.05,
+) -> None:
+    """Screen every accepted pair and publish only censor-allowed training splits."""
+    api_key = _require_api_key()
+    model_name = model or os.environ.get("OPENAI_MODEL", "gpt-5.5")
+    report = asyncio.run(
+        censor_llm_dataset(
+            resolve_path(results),
+            resolve_path(output),
+            api_key=api_key,
+            model=model_name,
+            batch_size=batch_size,
+            concurrency=concurrency,
+            max_attempts=max_attempts,
+            valid_fraction=valid_fraction,
+            test_fraction=test_fraction,
+        )
+    )
+    _emit(report)
+    if report["pairs"]["screening_failures_excluded"]:
+        raise typer.Exit(code=1)
+
+
+@app.command("review-llm-dataset")
+def review_llm_dataset_command(
+    results: Annotated[Path, typer.Option(help="Private dataset run results JSONL")] = Path(
+        "work/llm/run/results.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Private review Markdown")] = Path(
+        "work/llm/run/review.md"
+    ),
+    sample_size: Annotated[int, typer.Option(min=1, max=500)] = 50,
+) -> None:
+    """Render a private sample of generated pairs for human review."""
+    _emit(
+        create_llm_dataset_review(
+            resolve_path(results),
+            resolve_path(output),
+            sample_size=sample_size,
+        )
+    )
+
+
+@app.command("review-censor")
+def review_censor_command(
+    censor: Annotated[Path, typer.Option(help="Private censor screening JSONL")] = Path(
+        "work/llm/run/censor.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Private exclusion review Markdown")] = Path(
+        "work/llm/run/censor-review.md"
+    ),
+    max_rows: Annotated[int, typer.Option(min=1, max=1000)] = 200,
+) -> None:
+    """Render the censor's excluded rows for human spot-checking."""
+    _emit(
+        create_censor_review(
+            resolve_path(censor),
+            resolve_path(output),
+            max_rows=max_rows,
+        )
+    )
+
+
+@app.command("setup-adapter-environment")
+def setup_adapter_environment_command(
+    architecture: Annotated[
+        str,
+        typer.Argument(help="Adapter architecture: bart, flan_t5, marian, or qwen"),
+    ],
+    output: Annotated[Path, typer.Option(help="Private isolated virtual environment")],
+) -> None:
+    """Install an isolated local adapter-training environment."""
+    _emit(
+        setup_adapter_environment(
+            architecture,
+            resolve_path(output),
+            project_root=Path.cwd(),
+        )
+    )
+
+
+@app.command("train-adapter")
+def train_adapter_command(
+    config: Annotated[Path, typer.Option(help="Adapter configuration YAML")],
+    environment: Annotated[Path, typer.Option(help="Isolated adapter virtual environment")],
+    data: Annotated[Path, typer.Option(help="Censored adapter dataset root")] = Path(
+        "work/llm/run/dataset"
+    ),
+    output: Annotated[Path, typer.Option(help="Private adapter run directory")] = Path(
+        "outputs/adapters/run"
+    ),
+    benchmark: Annotated[
+        bool, typer.Option(help="Use the small architecture benchmark split")
+    ] = False,
+) -> None:
+    """Train a local seq2seq LoRA or Qwen QLoRA adapter."""
+    _emit(
+        train_adapter(
+            resolve_path(config),
+            resolve_path(data),
+            resolve_path(output),
+            resolve_path(environment),
+            benchmark=benchmark,
+            project_root=Path.cwd(),
+        )
+    )
+
+
+@app.command("predict-adapter")
+def predict_adapter_command(
+    config: Annotated[Path, typer.Option(help="Adapter configuration YAML")],
+    environment: Annotated[Path, typer.Option(help="Isolated adapter virtual environment")],
+    adapter: Annotated[Path, typer.Option(help="Private adapter run directory")],
+    data: Annotated[Path, typer.Option(help="Censored adapter dataset root")] = Path(
+        "work/llm/run/dataset"
+    ),
+    output: Annotated[Path, typer.Option(help="Private prediction JSONL")] = Path(
+        "work/llm/evaluation/predictions.jsonl"
+    ),
+    benchmark: Annotated[
+        bool, typer.Option(help="Use the small architecture benchmark split")
+    ] = False,
+    test_file: Annotated[
+        Path | None, typer.Option(help="Optional explicit seq2seq or MLX test JSONL")
+    ] = None,
+) -> None:
+    """Generate held-out predictions from a local adapter."""
+    _emit(
+        predict_adapter(
+            resolve_path(config),
+            resolve_path(data),
+            resolve_path(adapter),
+            resolve_path(output),
+            resolve_path(environment),
+            benchmark=benchmark,
+            data_file=resolve_path(test_file) if test_file else None,
+            project_root=Path.cwd(),
+        )
+    )
+
+
+@app.command("rewrite-adapter")
+def rewrite_adapter_command(
+    neutral_draft: Annotated[str, typer.Argument(help="Neutral draft to rewrite")],
+    config: Annotated[Path, typer.Option(help="Adapter configuration YAML")] = Path(
+        "configs/adapter-bart-base-v3.yaml"
+    ),
+    adapter: Annotated[Path, typer.Option(help="Private adapter run directory")] = Path(
+        "outputs/adapters/bart-llm-v3"
+    ),
+    environment: Annotated[Path, typer.Option(help="Isolated adapter environment")] = Path(
+        "work/envs/bart"
+    ),
+) -> None:
+    """Rewrite one draft with deterministic local adapter inference."""
+    typer.echo(
+        rewrite_with_adapter(
+            neutral_draft,
+            resolve_path(config),
+            resolve_path(adapter),
+            resolve_path(environment),
+            project_root=Path.cwd(),
+        )
+    )
 
 
 @app.command("train-tokenizer")
@@ -186,6 +426,19 @@ def privacy_audit_command(
     _emit(report)
     if not report["passed"]:
         raise typer.Exit(code=1)
+
+
+@app.command("export-messages-csv")
+def export_messages_csv_command(
+    messages: Annotated[Path, typer.Option(help="Extracted message JSONL")] = Path(
+        "work/extracted/messages.jsonl"
+    ),
+    output: Annotated[Path, typer.Option(help="Private spreadsheet-friendly CSV")] = Path(
+        "work/extracted/messages.csv"
+    ),
+) -> None:
+    """Export one message per CSV row with a readable local timestamp."""
+    _emit(export_messages_csv(resolve_path(messages), resolve_path(output)))
 
 
 @app.command("corpus-stats")
@@ -231,6 +484,7 @@ def train_command(
     """Train a decoder-only Transformer from random initialization with MLX."""
     training_config = load_yaml(config)
     selection_path = resolve_path(selection_report)
+    tokenizer_path = resolve_path(tokenizer)
     if training_config.get("name") != "smoke":
         if not selection_path.exists():
             raise typer.BadParameter(
@@ -251,7 +505,7 @@ def train_command(
     summary = train_model(
         training_config,
         resolve_path(data),
-        resolve_path(tokenizer),
+        tokenizer_path,
         resolve_path(output),
         resume_from=resolve_path(resume_from) if resume_from else None,
         compile_step=compile_step,
@@ -277,17 +531,21 @@ def export_command(
     output: Annotated[Path, typer.Option(help="Final private model directory")] = Path(
         "outputs/final"
     ),
-    metrics: Annotated[Path, typer.Option(help="Evaluation metrics JSON")] = Path(
-        "outputs/evaluation.json"
+    metrics: Annotated[Path | None, typer.Option(help="Evaluation metrics JSON")] = None,
+    split_report: Annotated[Path, typer.Option(help="Data split report")] = Path(
+        "work/reports/split-report.json"
+    ),
+    splits: Annotated[Path, typer.Option(help="Source JSONL split directory")] = Path(
+        "work/splits"
     ),
 ) -> None:
     """Export the inference-only local artifact."""
     manifest = export_model(
         resolve_path(checkpoint),
         resolve_path(output),
-        metrics_path=resolve_path(metrics),
-        split_report_path=resolve_path("work/reports/split-report.json"),
-        split_dir=resolve_path("work/splits"),
+        metrics_path=resolve_path(metrics) if metrics else None,
+        split_report_path=resolve_path(split_report),
+        split_dir=resolve_path(splits),
     )
     _emit(manifest)
 

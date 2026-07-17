@@ -26,6 +26,14 @@ def test_generation_is_bounded_and_prompt_uses_roles() -> None:
         temperature=0.0,
     )
     assert len(generated) == 5
+    stopped = generate_ids(
+        model,
+        [1, 2, 3],
+        eos_ids=set(range(32)),
+        max_new_tokens=5,
+        temperature=0.0,
+    )
+    assert stopped == []
     prompt = format_reply_prompt("hello", [("other", "earlier"), ("me", "reply")])
     assert prompt.startswith("<|bos|><|conversation|>")
     assert prompt.endswith("<|me|>")

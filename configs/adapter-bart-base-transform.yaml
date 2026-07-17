@@ -1,0 +1,44 @@
+name: bart-base-transform-lora
+architecture: bart
+base_model: facebook/bart-base
+revision: aadd2ab0ae0c8268c7c9693540e9904811f36177
+source_prefix: "personal rewrite: "
+max_length: 256
+max_new_tokens: 256
+batch_size: 2
+gradient_accumulation_steps: 8
+epochs: 6
+learning_rate: 0.0001
+weight_decay: 0.01
+warmup_fraction: 0.06
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - out_proj
+  - fc1
+  - fc2
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+early_stopping_patience: 2
+decoding:
+  best_of: 4
+  temperature: 0.8
+  top_p: 0.9
+  min_new_tokens_ratio: 0.35
+  min_new_tokens_cap: 24
+  length_ratio_min: 0.3
+  length_ratio_max: 1.6
+  copy_escape_jaccard: 1.0
+sampling:
+  enabled: true
+  exact_copy_weight: 0.25
+  near_copy_threshold: 0.9
+  near_copy_weight: 0.5
+  strong_threshold: 0.7
+  strong_weight: 1.5
+  strong_min_length_ratio: 0.65
+  strong_max_length_ratio: 1.2
+  require_source_numbers: true
+seed: 42
