@@ -35,4 +35,18 @@ Run `uv run imessage-download download --help` for all options.
 The structured exports omit deleted or retracted rows, reactions, system events, and
 attachment-only rows. The `chat.db` snapshot retains the complete database.
 
+## Conversation chunking
+
+After downloading, group messages from the same chat into conversation sessions:
+
+```bash
+uv run imessage-download chunk
+```
+
+This command is separate from `download`; downloading does not run it automatically. By
+default, it writes `work/imessages/sessions.jsonl` and
+`work/imessages/session-report.json`. A new session starts after six hours of inactivity,
+and consecutive messages from the same sender within two minutes are merged into one turn.
+Use `uv run imessage-download chunk --help` to change the paths or timing windows.
+
 All outputs contain private data and are ignored by Git.

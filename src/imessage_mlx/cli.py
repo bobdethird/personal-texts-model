@@ -8,6 +8,7 @@ import typer
 
 from imessage_mlx.data.extract import extract_messages
 from imessage_mlx.data.inspect_schema import inspect_schema
+from imessage_mlx.data.sessions import build_sessions
 from imessage_mlx.data.snapshot import can_open_readonly, create_snapshot
 from imessage_mlx.data.table_export import export_messages_csv
 from imessage_mlx.utils import ensure_private_dir
@@ -103,3 +104,37 @@ def download(
             "csv": csv_export,
         }
     )
+
+
+@app.command()
+def chunk(
+    messages: Annotated[
+        Path,
+        typer.Option(help="Extracted message JSONL"),
+    ] = Path("work/imessages/messages.jsonl"),
+    output: Annotated[
+        Path,
+        typer.Option(help="Conversation-session JSONL"),
+    ] = Path("work/imessages/sessions.jsonl"),
+    report: Annotated[
+        Path,
+        typer.Option(help="Sessionization report JSON"),
+    ] = Path("work/imessages/session-report.json"),
+    session_gap_minutes: Annotated[
+        int,
+        typer.Option(min=1, help="Start a new session after this many inactive minutes"),
+    ] = 360,
+    merge_gap_minutes: Annotated[
+        int,
+        typer.Option(min=0, help="Merge consecutive same-sender messages within this window"),
+    ] = 2,
+) -> None:
+    """Group an existing message export into conversation sessions."""
+    result = build_sessions(
+        messages.expanduser().resolve(),
+        output.expanduser().resolve(),
+        report.expanduser().resolve(),
+        session_gap_minutes=session_gap_minutes,
+        merge_gap_minutes=merge_gap_minutes,
+    )
+    _emit(result)
