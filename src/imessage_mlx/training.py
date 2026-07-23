@@ -27,37 +27,121 @@ def configure_tokenizer(tokenizer: Any) -> int:
     return int(added)
 
 
-def render_example_parts(record: dict[str, Any]) -> tuple[str, str]:
-    """Render history/prompt separately from the one supervised target."""
+def _render_turn_text(message: dict[str, Any]) -> str:
+    role = message.get("role")
+    if role not in {"user", "assistant"}:
+        raise ValueError(f"Unsupported conversation role {role!r}")
+    marker = "<|user|>" if role == "user" else "<|assistant|>"
+    parts = [marker]
+    participant = message.get("participant")
+    if role == "user" and participant:
+        parts.append(f"[participant:{participant}]\n")
+    parts.append(str(message.get("content", "")))
+    parts.append("<|turn_end|>\n")
+    return "".join(parts)
+
+
+def render_session_turns(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Render each conversation turn with an explicit supervised flag."""
     if record.get("format") != SFT_FORMAT:
         raise ValueError(f"Unsupported SFT format {record.get('format')!r}")
     messages = record.get("messages")
     if not isinstance(messages, list) or not messages:
         raise ValueError("SFT example must contain at least one message")
-    target_index = int(record.get("target_index", -1))
-    if target_index != len(messages) - 1:
-        raise ValueError("The target must be the final message")
-    if messages[target_index].get("role") != "assistant":
-        raise ValueError("The target must have the assistant role")
 
-    prompt = ["<|conversation|>\n"]
+    supervised = set(int(index) for index in record.get("supervised_indexes", []))
+    if not supervised:
+        supervised = {
+            index
+            for index, message in enumerate(messages)
+            if message.get("role") == "assistant"
+        }
+    if not supervised:
+        raise ValueError("SFT example must supervise at least one assistant turn")
+
+    turns: list[dict[str, Any]] = []
     for index, message in enumerate(messages):
         role = message.get("role")
         if role not in {"user", "assistant"}:
             raise ValueError(f"Unsupported conversation role {role!r}")
-        marker = "<|user|>" if role == "user" else "<|assistant|>"
-        if index == target_index:
-            prompt.append(marker)
-            break
-        prompt.append(marker)
-        participant = message.get("participant")
-        if role == "user" and participant:
-            prompt.append(f"[participant:{participant}]\n")
-        prompt.append(str(message.get("content", "")))
-        prompt.append("<|turn_end|>\n")
+        is_supervised = index in supervised
+        if is_supervised and role != "assistant":
+            raise ValueError("Only assistant turns may be supervised")
+        turns.append(
+            {
+                "role": role,
+                "text": _render_turn_text(message),
+                "supervised": is_supervised,
+            }
+        )
+    return turns
 
-    target = f"{messages[target_index].get('content', '')}<|turn_end|>"
-    return "".join(prompt), target
+
+def _tokenize_turn(tokenizer: Any, turn: dict[str, Any]) -> dict[str, Any]:
+    token_ids = list(tokenizer.encode(turn["text"], add_special_tokens=False))
+    if not token_ids:
+        raise ValueError("Tokenizer produced an empty conversation turn")
+    return {
+        "role": turn["role"],
+        "token_ids": token_ids,
+        "supervised": bool(turn["supervised"]),
+    }
+
+
+def _pack_window(
+    prefix_ids: list[int],
+    turns: list[dict[str, Any]],
+) -> dict[str, Any]:
+    input_ids = list(prefix_ids)
+    labels = [-100] * len(prefix_ids)
+    for turn in turns:
+        start = len(input_ids)
+        input_ids.extend(turn["token_ids"])
+        if turn["supervised"]:
+            labels.extend(turn["token_ids"])
+        else:
+            labels.extend([-100] * len(turn["token_ids"]))
+        # Never train on the first token of the whole sequence.
+        if start == 0:
+            labels[0] = -100
+    return {
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
+        "labels": labels,
+    }
+
+
+def _split_oversized_turn(
+    turn: dict[str, Any],
+    *,
+    budget: int,
+) -> list[dict[str, Any]]:
+    """Split a single turn that cannot fit in one window.
+
+    Supervised turns are sliced into full-budget segments; only the first segment
+    carries the role marker, and every segment stays supervised so no target token
+    is lost. Oversized masked turns are truncated instead.
+    """
+    token_ids = turn["token_ids"]
+    if budget < 1:
+        raise ValueError("max_length is too small for the transcript delimiters")
+    if len(token_ids) <= budget:
+        return [turn]
+
+    if not turn["supervised"]:
+        # Drop excess masked context rather than inventing partial user turns.
+        return [{"role": turn["role"], "token_ids": token_ids[:budget], "supervised": False}]
+
+    segments: list[dict[str, Any]] = []
+    for start in range(0, len(token_ids), budget):
+        segments.append(
+            {
+                "role": turn["role"],
+                "token_ids": token_ids[start : start + budget],
+                "supervised": True,
+            }
+        )
+    return segments
 
 
 def encode_sft_record(
@@ -66,48 +150,107 @@ def encode_sft_record(
     *,
     max_length: int,
 ) -> list[dict[str, Any]]:
-    """Tokenize one target, masking all history and retaining every target token."""
+    """Tokenize a session, supervising every assistant turn exactly once.
+
+    Sessions that exceed ``max_length`` are split into contiguous windows. Each
+    assistant turn is fully contained in one window and contributes to loss there.
+    When a window boundary falls mid-session, earlier turns may be repeated as
+    masked context so later assistant replies still see recent history.
+    """
     if max_length < 8:
         raise ValueError("max_length must be at least 8")
 
-    prompt, target = render_example_parts(record)
-    prompt_ids = list(tokenizer.encode(prompt, add_special_tokens=False))
-    target_ids = list(tokenizer.encode(target, add_special_tokens=False))
-    if not prompt_ids:
-        raise ValueError("Tokenizer produced an empty conversation prompt")
-    if not target_ids:
-        raise ValueError("Tokenizer produced an empty target")
+    rendered = render_session_turns(record)
+    tokenized = [_tokenize_turn(tokenizer, turn) for turn in rendered]
+    conversation_prefix = list(
+        tokenizer.encode("<|conversation|>\n", add_special_tokens=False)
+    )
+    if not conversation_prefix:
+        raise ValueError("Tokenizer produced an empty conversation marker")
 
     bos_token_id = getattr(tokenizer, "bos_token_id", None)
-    anchor = ([int(bos_token_id)] if bos_token_id is not None else []) + prompt_ids[:1]
-    recent_prompt = prompt_ids[1:]
-    maximum_segment = max_length - len(anchor) - 1
-    if maximum_segment < 1:
+    prefix = ([int(bos_token_id)] if bos_token_id is not None else []) + conversation_prefix
+    if len(prefix) >= max_length:
         raise ValueError("max_length is too small for the transcript delimiters")
-    segment_size = (
-        len(target_ids)
-        if len(target_ids) <= maximum_segment
-        else min(maximum_segment, max(1, max_length // 2))
-    )
 
-    chunks: list[dict[str, Any]] = []
-    for start in range(0, len(target_ids), segment_size):
-        target_segment = target_ids[start : start + segment_size]
-        context = recent_prompt + target_ids[:start]
-        context_budget = max_length - len(anchor) - len(target_segment)
-        recent_context = context[-context_budget:] if context_budget else []
-        input_ids = anchor + recent_context + target_segment
-        target_start = len(anchor) + len(recent_context)
-        labels = [-100] * target_start + target_segment.copy()
-        labels[0] = -100
-        chunks.append(
-            {
-                "input_ids": input_ids,
-                "attention_mask": [1] * len(input_ids),
-                "labels": labels,
-            }
+    windows: list[dict[str, Any]] = []
+    pending = tokenized
+    carry: list[dict[str, Any]] = []
+
+    while pending:
+        budget = max_length - len(prefix)
+        selected: list[dict[str, Any]] = []
+        used = 0
+        rewrote_pending = False
+
+        # Prefer recent masked carry-over so the next supervised turn keeps history.
+        for turn in reversed(carry):
+            if used + len(turn["token_ids"]) > budget:
+                break
+            selected.insert(0, {**turn, "supervised": False})
+            used += len(turn["token_ids"])
+
+        consumed = 0
+        for turn in pending:
+            turn_ids = turn["token_ids"]
+            if used + len(turn_ids) <= budget:
+                selected.append(turn)
+                used += len(turn_ids)
+                consumed += 1
+                continue
+
+            if not selected or (
+                all(not item["supervised"] for item in selected) and turn["supervised"]
+            ):
+                # Either the window is empty, or it only has masked context that leaves
+                # no room for the next supervised turn. Drop the masked filler and pack
+                # the supervised turn on its own (splitting if needed).
+                selected = []
+                used = 0
+                segments = _split_oversized_turn(turn, budget=budget)
+                selected.append(segments[0])
+                pending = segments[1:] + pending[consumed + 1 :]
+                rewrote_pending = True
+                break
+
+            # Close the window before a turn we cannot fit whole.
+            break
+
+        if not selected:
+            raise RuntimeError("Failed to pack any turns into a training window")
+
+        window = _pack_window(prefix, selected)
+        if len(window["input_ids"]) > max_length:
+            raise RuntimeError("Packed window exceeded max_length")
+        if all(label == -100 for label in window["labels"]):
+            # Keep the masked turns as carry and advance past them.
+            carry = [{**turn, "supervised": False} for turn in selected]
+            if rewrote_pending:
+                continue
+            if consumed:
+                pending = pending[consumed:]
+                continue
+            pending = pending[1:]
+            continue
+
+        windows.append(window)
+        carry = [{**turn, "supervised": False} for turn in selected]
+        if not rewrote_pending:
+            pending = pending[consumed:]
+
+    # Every supervised turn must appear in exactly one window's labels.
+    supervised_token_total = sum(
+        len(turn["token_ids"]) for turn in tokenized if turn["supervised"]
+    )
+    emitted_supervised = sum(
+        sum(1 for label in window["labels"] if label != -100) for window in windows
+    )
+    if emitted_supervised != supervised_token_total:
+        raise RuntimeError(
+            "Window packing changed the supervised token count: "
+            f"expected {supervised_token_total}, got {emitted_supervised}"
         )
-    return chunks
+    return windows
 
 
 def _tokenize_dataset(dataset: Any, tokenizer: Any, max_length: int) -> Any:

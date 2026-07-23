@@ -159,12 +159,8 @@ def prepare_sft(
         float,
         typer.Option(min=0.0, max=0.99, help="Fraction of whole sessions held out"),
     ] = 0.05,
-    max_history_messages: Annotated[
-        int,
-        typer.Option(min=0, help="Maximum prior messages per target; 0 keeps all history"),
-    ] = 0,
 ) -> None:
-    """Build one conversational SFT example for every message sent by me."""
+    """Build one multi-turn SFT example per conversation session."""
     output_path = output.expanduser().resolve()
     result = prepare_sft_dataset(
         messages.expanduser().resolve(),
@@ -173,6 +169,5 @@ def prepare_sft(
         output_path / "report.json",
         session_gap_minutes=session_gap_minutes,
         validation_fraction=validation_fraction,
-        max_history_messages=max_history_messages or None,
     )
     _emit(result)

@@ -6,7 +6,7 @@ from typing import Any
 from imessage_mlx.data.sessions import iter_message_sessions
 from imessage_mlx.utils import read_jsonl, sha256_text, write_json, write_jsonl
 
-SFT_FORMAT = "imessage-next-message-v1"
+SFT_FORMAT = "imessage-session-v2"
 
 
 def _session_id(chat_id: str, messages: list[dict[str, Any]]) -> str:
@@ -48,59 +48,49 @@ def prepare_sft_dataset(
     *,
     session_gap_minutes: int = 360,
     validation_fraction: float = 0.05,
-    max_history_messages: int | None = None,
 ) -> dict[str, Any]:
-    """Create one next-message SFT example for every outgoing message.
+    """Create one multi-turn SFT example per conversation session.
 
-    The final message in every example is the sole loss target. Earlier outgoing
-    messages remain useful context but are masked by the training tokenizer, and
-    incoming messages are never selected as targets.
+    Every outgoing (`me`) message in the session is an assistant turn and will be
+    supervised during training. Incoming messages stay in the transcript as masked
+    context. Sessions with no outgoing messages are skipped. Token windows longer
+    than the model context are handled later by the training encoder.
     """
     if not 0 <= validation_fraction < 1:
         raise ValueError("validation_fraction must be in [0, 1)")
-    if max_history_messages is not None and max_history_messages < 0:
-        raise ValueError("max_history_messages cannot be negative")
 
     source_messages = list(read_jsonl(messages_path))
     train_records: list[dict[str, Any]] = []
     validation_records: list[dict[str, Any]] = []
     session_count = 0
-    target_count = 0
+    skipped_without_outgoing = 0
+    supervised_outgoing = 0
 
     for chat_id, session in iter_message_sessions(
         source_messages, session_gap_minutes=session_gap_minutes
     ):
         session_count += 1
+        conversation = [_conversation_message(message) for message in session]
+        assistant_indexes = [
+            index for index, message in enumerate(conversation) if message["role"] == "assistant"
+        ]
+        if not assistant_indexes:
+            skipped_without_outgoing += 1
+            continue
+
         session_id = _session_id(chat_id, session)
-        destination = (
-            validation_records
-            if _validation_session(session_id, validation_fraction)
-            else train_records
-        )
-
-        for target_position, message in enumerate(session):
-            if message["sender_role"] != "me":
-                continue
-
-            history_start = 0
-            if max_history_messages is not None:
-                history_start = max(0, target_position - max_history_messages)
-            selected = session[history_start : target_position + 1]
-            conversation = [_conversation_message(item) for item in selected]
-            target_index = len(conversation) - 1
-            target_count += 1
-            destination.append(
-                {
-                    "format": SFT_FORMAT,
-                    "example_id": sha256_text(
-                        f"{session_id}\0{message['message_id']}\0{target_position}"
-                    )[:24],
-                    "session_id": session_id,
-                    "target_message_id": str(message["message_id"]),
-                    "target_index": target_index,
-                    "messages": conversation,
-                }
-            )
+        supervised_outgoing += len(assistant_indexes)
+        record = {
+            "format": SFT_FORMAT,
+            "example_id": session_id,
+            "session_id": session_id,
+            "messages": conversation,
+            "supervised_indexes": assistant_indexes,
+        }
+        if _validation_session(session_id, validation_fraction):
+            validation_records.append(record)
+        else:
+            train_records.append(record)
 
     write_jsonl(train_path, train_records)
     write_jsonl(validation_path, validation_records)
@@ -108,13 +98,13 @@ def prepare_sft_dataset(
         "format": SFT_FORMAT,
         "input_messages": len(source_messages),
         "session_count": session_count,
-        "target_outgoing_messages": target_count,
+        "skipped_sessions_without_outgoing": skipped_without_outgoing,
+        "supervised_outgoing_messages": supervised_outgoing,
         "train_examples": len(train_records),
         "validation_examples": len(validation_records),
         "validation_fraction": validation_fraction,
         "session_gap_minutes": session_gap_minutes,
-        "max_history_messages": max_history_messages,
-        "loss_policy": "final assistant message only",
+        "loss_policy": "every assistant turn in the session",
     }
     write_json(report_path, report)
     return report

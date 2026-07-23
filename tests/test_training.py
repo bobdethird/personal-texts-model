@@ -1,7 +1,7 @@
 from typing import Any
 
 from imessage_mlx.data.sft import SFT_FORMAT
-from imessage_mlx.training import encode_sft_record, render_example_parts
+from imessage_mlx.training import encode_sft_record, render_session_turns
 
 
 class CharacterTokenizer:
@@ -12,64 +12,77 @@ class CharacterTokenizer:
         return [ord(character) + 10 for character in text]
 
 
-def _record(target: str = "My reply") -> dict[str, Any]:
+def _record() -> dict[str, Any]:
     return {
         "format": SFT_FORMAT,
         "example_id": "example",
-        "target_index": 2,
+        "session_id": "session",
+        "supervised_indexes": [1, 2],
         "messages": [
             {
                 "role": "user",
                 "content": "Incoming",
                 "participant": "person-a",
             },
-            {"role": "assistant", "content": "Earlier reply"},
-            {"role": "assistant", "content": target},
+            {"role": "assistant", "content": "First reply"},
+            {"role": "assistant", "content": "Second reply"},
         ],
     }
 
 
-def test_renderer_keeps_the_target_out_of_the_prompt() -> None:
-    prompt, target = render_example_parts(_record())
+def test_renderer_marks_every_assistant_turn_as_supervised() -> None:
+    turns = render_session_turns(_record())
 
-    assert "Incoming" in prompt
-    assert "Earlier reply" in prompt
-    assert "[participant:person-a]" in prompt
-    assert "My reply" not in prompt
-    assert prompt.endswith("<|assistant|>")
-    assert target == "My reply<|turn_end|>"
+    assert [turn["supervised"] for turn in turns] == [False, True, True]
+    assert "[participant:person-a]" in turns[0]["text"]
+    assert turns[0]["text"].startswith("<|user|>")
+    assert turns[1]["text"].startswith("<|assistant|>")
+    assert turns[1]["text"].endswith("<|turn_end|>\n")
 
 
-def test_encoder_masks_history_and_supervises_only_target() -> None:
+def test_encoder_masks_user_turns_and_supervises_every_assistant_turn() -> None:
     tokenizer = CharacterTokenizer()
     chunks = encode_sft_record(_record(), tokenizer, max_length=512)
-    expected_target = tokenizer.encode("My reply<|turn_end|>", add_special_tokens=False)
 
     assert len(chunks) == 1
     chunk = chunks[0]
+    expected_first = tokenizer.encode(
+        "<|assistant|>First reply<|turn_end|>\n", add_special_tokens=False
+    )
+    expected_second = tokenizer.encode(
+        "<|assistant|>Second reply<|turn_end|>\n", add_special_tokens=False
+    )
     supervised = [label for label in chunk["labels"] if label != -100]
-    assert supervised == expected_target
-    assert chunk["labels"][:-len(expected_target)] == [-100] * (
-        len(chunk["labels"]) - len(expected_target)
-    )
+    assert supervised == expected_first + expected_second
     assert len(chunk["input_ids"]) == len(chunk["labels"])
+    assert chunk["labels"][0] == -100
 
 
-def test_long_targets_are_chunked_without_dropping_or_repeating_loss_tokens() -> None:
+def test_long_sessions_are_windowed_without_dropping_supervised_tokens() -> None:
     tokenizer = CharacterTokenizer()
-    target_text = "abcdefghijklmnopqrstuvwxyz" * 3
-    chunks = encode_sft_record(_record(target_text), tokenizer, max_length=24)
-    expected_target = tokenizer.encode(
-        f"{target_text}<|turn_end|>", add_special_tokens=False
-    )
+    long_reply = "abcdefghijklmnopqrstuvwxyz" * 4
+    record = {
+        "format": SFT_FORMAT,
+        "example_id": "long",
+        "session_id": "session",
+        "supervised_indexes": [1, 3],
+        "messages": [
+            {"role": "user", "content": "Start"},
+            {"role": "assistant", "content": long_reply},
+            {"role": "user", "content": "Continue"},
+            {"role": "assistant", "content": "Short"},
+        ],
+    }
+    chunks = encode_sft_record(record, tokenizer, max_length=64)
+    expected = []
+    for turn in render_session_turns(record):
+        if turn["supervised"]:
+            expected.extend(tokenizer.encode(turn["text"], add_special_tokens=False))
 
     supervised = [
-        label
-        for chunk in chunks
-        for label in chunk["labels"]
-        if label != -100
+        label for chunk in chunks for label in chunk["labels"] if label != -100
     ]
     assert len(chunks) > 1
-    assert supervised == expected_target
-    assert all(len(chunk["input_ids"]) <= 24 for chunk in chunks)
+    assert supervised == expected
+    assert all(len(chunk["input_ids"]) <= 64 for chunk in chunks)
     assert all(chunk["labels"][0] == -100 for chunk in chunks)

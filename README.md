@@ -60,19 +60,18 @@ uv run imessage-download prepare-sft
 ```
 
 This writes private `train.jsonl`, `validation.jsonl`, and `report.json` files under
-`work/imessages/sft/`. The improved sessionizer first separates chats at six-hour
-inactivity gaps, then emits one example for **every** outgoing (`me`) message. It does
-not merge consecutive outgoing messages.
+`work/imessages/sft/`. The sessionizer first separates chats at six-hour inactivity
+gaps, then emits **one example per conversation session** that contains at least one
+outgoing (`me`) message. Consecutive outgoing messages are not merged.
 
-Each record has ordinary conversational messages and an explicit final target:
+Each record is a full multi-turn transcript:
 
 ```json
 {
-  "format": "imessage-next-message-v1",
+  "format": "imessage-session-v2",
   "example_id": "...",
   "session_id": "...",
-  "target_message_id": "...",
-  "target_index": 2,
+  "supervised_indexes": [1, 2],
   "messages": [
     {"role": "user", "content": "Are you free later?"},
     {"role": "assistant", "content": "Probably after six"},
@@ -81,19 +80,20 @@ Each record has ordinary conversational messages and an explicit final target:
 }
 ```
 
-The final assistant message is the only loss target. Earlier messages—including
-earlier messages from you—are context with labels set to `-100`, so no incoming
-message token contributes to training loss. Each earlier outgoing message is still
-trained once as the final target of its own example. Group-chat user messages retain
-their pseudonymous participant as input-only metadata.
+Every assistant turn is a loss target. User turns stay in the transcript as context
+with labels set to `-100`, so no incoming message token contributes to training loss.
+Because the model is causal, supervising all of your turns in one session gives each
+turn the same conditional history as emitting a separate example per message, without
+re-encoding the shared prefix over and over. Group-chat user messages retain their
+pseudonymous participant as input-only metadata.
 
 Validation is split by whole conversation session to prevent overlapping histories
-from appearing in both splits. Token-length chunking keeps the latest history, keeps
-the conversation marker, and, for unusually long outgoing messages, creates multiple
-chunks while supervising each target token exactly once.
+from appearing in both splits. During training, sessions longer than the model context
+are split into windows (default `max_length=4096`). Each of your messages is fully
+contained in one window and supervised there exactly once; earlier turns may be
+repeated as masked context so later replies still see recent history.
 
-Use `prepare-sft --help` to change the session gap, validation fraction, or cap the
-number of prior messages included in each record.
+Use `prepare-sft --help` to change the session gap or validation fraction.
 
 ## Train on Modal (A100)
 
@@ -134,5 +134,6 @@ uv run --extra train modal run --detach modal_train.py \
 ```
 
 The Modal function is pinned to `gpu="A100-80GB"` and uses BF16, TF32, gradient
-checkpointing, fused AdamW, and LoRA over all linear layers. Run
-`uv run --extra train modal run modal_train.py --help` for all hyperparameters.
+checkpointing, fused AdamW, and LoRA over all linear layers. The default context
+length is 4096 tokens. Run `uv run --extra train modal run modal_train.py --help`
+for all hyperparameters.

@@ -25,7 +25,7 @@ def _message(
     }
 
 
-def test_creates_one_final_assistant_target_for_every_outgoing_message(
+def test_creates_one_session_example_supervising_every_outgoing_message(
     tmp_path: Path,
 ) -> None:
     messages = [
@@ -50,29 +50,36 @@ def test_creates_one_final_assistant_target_for_every_outgoing_message(
     )
     records = list(read_jsonl(train))
 
-    assert report["target_outgoing_messages"] == 3
-    assert report["train_examples"] == 3
+    assert report["supervised_outgoing_messages"] == 3
+    assert report["train_examples"] == 1
     assert list(read_jsonl(validation)) == []
-    assert [record["target_message_id"] for record in records] == [
-        "mine-1",
-        "mine-2",
-        "mine-3",
-    ]
-    assert all(record["format"] == SFT_FORMAT for record in records)
-    assert all(record["target_index"] == len(record["messages"]) - 1 for record in records)
-    assert all(record["messages"][-1]["role"] == "assistant" for record in records)
-    assert records[1]["messages"] == [
+    assert len(records) == 1
+    record = records[0]
+    assert record["format"] == SFT_FORMAT
+    assert record["supervised_indexes"] == [1, 2, 4]
+    assert record["messages"] == [
         {"role": "user", "content": "Question"},
         {"role": "assistant", "content": "First reply"},
         {"role": "assistant", "content": "One more thing"},
+        {"role": "user", "content": "Okay"},
+        {"role": "assistant", "content": "Last reply"},
     ]
 
 
-def test_limits_history_and_preserves_group_speaker_metadata(tmp_path: Path) -> None:
+def test_skips_sessions_without_outgoing_and_keeps_group_speaker_metadata(
+    tmp_path: Path,
+) -> None:
     messages = [
         _message(
-            "other-a",
+            "other-only",
             timestamp_ns=1,
+            sender_role="other",
+            text="Nobody home",
+            chat_id="chat-b",
+        ),
+        _message(
+            "other-a",
+            timestamp_ns=10,
             sender_role="other",
             text="From A",
             participant_id="person-a",
@@ -80,7 +87,7 @@ def test_limits_history_and_preserves_group_speaker_metadata(tmp_path: Path) -> 
         ),
         _message(
             "other-b",
-            timestamp_ns=2,
+            timestamp_ns=11,
             sender_role="other",
             text="From B",
             participant_id="person-b",
@@ -88,7 +95,7 @@ def test_limits_history_and_preserves_group_speaker_metadata(tmp_path: Path) -> 
         ),
         _message(
             "mine",
-            timestamp_ns=3,
+            timestamp_ns=12,
             sender_role="me",
             text="My answer",
             participant_id="me",
@@ -98,17 +105,23 @@ def test_limits_history_and_preserves_group_speaker_metadata(tmp_path: Path) -> 
     source = tmp_path / "messages.jsonl"
     write_jsonl(source, messages)
 
-    prepare_sft_dataset(
+    report = prepare_sft_dataset(
         source,
         tmp_path / "train.jsonl",
         tmp_path / "validation.jsonl",
         tmp_path / "report.json",
         validation_fraction=0,
-        max_history_messages=1,
     )
-    record = next(read_jsonl(tmp_path / "train.jsonl"))
+    records = list(read_jsonl(tmp_path / "train.jsonl"))
 
-    assert record["messages"] == [
+    assert report["skipped_sessions_without_outgoing"] == 1
+    assert report["train_examples"] == 1
+    assert records[0]["messages"] == [
+        {
+            "role": "user",
+            "content": "From A",
+            "participant": "person-a",
+        },
         {
             "role": "user",
             "content": "From B",
@@ -116,3 +129,4 @@ def test_limits_history_and_preserves_group_speaker_metadata(tmp_path: Path) -> 
         },
         {"role": "assistant", "content": "My answer"},
     ]
+    assert records[0]["supervised_indexes"] == [2]

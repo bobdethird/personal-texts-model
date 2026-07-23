@@ -69,10 +69,10 @@ def _safe_run_name(value: str) -> str:
 
 @app.local_entrypoint()
 def main(
-    dataset_dir: Path = Path("work/imessages/sft"),
+    dataset_dir: str = "work/imessages/sft",
     run_name: str = "",
     model_name: str = DEFAULT_MODEL,
-    max_length: int = 2048,
+    max_length: int = 4096,
     epochs: float = 3.0,
     batch_size: int = 2,
     gradient_accumulation_steps: int = 8,
@@ -89,7 +89,7 @@ def main(
     resume: bool = False,
 ) -> None:
     """Upload a prepared private dataset and train a masked LoRA on an A100."""
-    dataset_dir = dataset_dir.expanduser().resolve()
+    dataset_dir = Path(dataset_dir).expanduser().resolve()
     train_path = dataset_dir / "train.jsonl"
     validation_path = dataset_dir / "validation.jsonl"
     if not train_path.is_file():
