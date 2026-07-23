@@ -116,3 +116,28 @@ def test_limits_history_and_preserves_group_speaker_metadata(tmp_path: Path) -> 
         },
         {"role": "assistant", "content": "My answer"},
     ]
+
+
+def test_validation_uses_whole_sessions_and_keeps_training_nonempty(tmp_path: Path) -> None:
+    messages = [
+        _message("a-in", chat_id="chat-a", timestamp_ns=1, sender_role="other", text="A"),
+        _message("a-me", chat_id="chat-a", timestamp_ns=2, sender_role="me", text="Reply A"),
+        _message("b-in", chat_id="chat-b", timestamp_ns=1, sender_role="other", text="B"),
+        _message("b-me", chat_id="chat-b", timestamp_ns=2, sender_role="me", text="Reply B"),
+    ]
+    source = tmp_path / "messages.jsonl"
+    write_jsonl(source, messages)
+
+    report = prepare_sft_dataset(
+        source,
+        tmp_path / "train.jsonl",
+        tmp_path / "validation.jsonl",
+        tmp_path / "report.json",
+        validation_fraction=0.05,
+    )
+    train = list(read_jsonl(tmp_path / "train.jsonl"))
+    validation = list(read_jsonl(tmp_path / "validation.jsonl"))
+
+    assert report["validation_sessions"] == 1
+    assert len(train) == len(validation) == 1
+    assert train[0]["session_id"] != validation[0]["session_id"]

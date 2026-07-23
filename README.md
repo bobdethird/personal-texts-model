@@ -88,9 +88,9 @@ trained once as the final target of its own example. Group-chat user messages re
 their pseudonymous participant as input-only metadata.
 
 Validation is split by whole conversation session to prevent overlapping histories
-from appearing in both splits. Token-length chunking keeps the latest history, keeps
-the conversation marker, and, for unusually long outgoing messages, creates multiple
-chunks while supervising each target token exactly once.
+from appearing in both splits. Token-length chunking keeps the latest history and the
+complete target. For unusually long outgoing messages, it creates multiple chunks
+while supervising each target token exactly once.
 
 Use `prepare-sft --help` to change the session gap, validation fraction, or cap the
 number of prior messages included in each record.

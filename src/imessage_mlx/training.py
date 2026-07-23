@@ -7,24 +7,13 @@ from typing import Any
 
 from imessage_mlx.data.sft import SFT_FORMAT
 
-SPECIAL_TOKENS = (
-    "<|conversation|>",
-    "<|user|>",
-    "<|assistant|>",
-    "<|turn_end|>",
-)
 
-
-def configure_tokenizer(tokenizer: Any) -> int:
-    """Register the stable transcript delimiters and return the added-token count."""
-    added = tokenizer.add_special_tokens(
-        {"additional_special_tokens": list(SPECIAL_TOKENS)}
-    )
+def configure_tokenizer(tokenizer: Any) -> None:
+    """Configure padding without adding randomly initialized vocabulary rows."""
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token is None:
             raise ValueError("Tokenizer must provide either a pad token or an EOS token")
         tokenizer.pad_token = tokenizer.eos_token
-    return int(added)
 
 
 def render_example_parts(record: dict[str, Any]) -> tuple[str, str]:
@@ -73,14 +62,16 @@ def encode_sft_record(
     prompt, target = render_example_parts(record)
     prompt_ids = list(tokenizer.encode(prompt, add_special_tokens=False))
     target_ids = list(tokenizer.encode(target, add_special_tokens=False))
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None and (not target_ids or target_ids[-1] != eos_token_id):
+        target_ids.append(int(eos_token_id))
     if not prompt_ids:
         raise ValueError("Tokenizer produced an empty conversation prompt")
     if not target_ids:
         raise ValueError("Tokenizer produced an empty target")
 
     bos_token_id = getattr(tokenizer, "bos_token_id", None)
-    anchor = ([int(bos_token_id)] if bos_token_id is not None else []) + prompt_ids[:1]
-    recent_prompt = prompt_ids[1:]
+    anchor = [int(bos_token_id)] if bos_token_id is not None else []
     maximum_segment = max_length - len(anchor) - 1
     if maximum_segment < 1:
         raise ValueError("max_length is too small for the transcript delimiters")
@@ -93,7 +84,7 @@ def encode_sft_record(
     chunks: list[dict[str, Any]] = []
     for start in range(0, len(target_ids), segment_size):
         target_segment = target_ids[start : start + segment_size]
-        context = recent_prompt + target_ids[:start]
+        context = prompt_ids + target_ids[:start]
         context_budget = max_length - len(anchor) - len(target_segment)
         recent_context = context[-context_budget:] if context_budget else []
         input_ids = anchor + recent_context + target_segment
@@ -161,7 +152,6 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         dtype=torch.bfloat16,
         attn_implementation="sdpa",
     )
-    model.resize_token_embeddings(len(tokenizer))
     model.config.use_cache = False
     model = get_peft_model(
         model,
@@ -177,14 +167,10 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     model.print_trainable_parameters()
 
     train_dataset = load_dataset("json", data_files=str(train_path), split="train")
-    train_dataset = _tokenize_dataset(
-        train_dataset, tokenizer, int(config["max_length"])
-    )
+    train_dataset = _tokenize_dataset(train_dataset, tokenizer, int(config["max_length"]))
     validation_dataset = None
     if validation_path.is_file() and validation_path.stat().st_size:
-        validation_dataset = load_dataset(
-            "json", data_files=str(validation_path), split="train"
-        )
+        validation_dataset = load_dataset("json", data_files=str(validation_path), split="train")
         validation_dataset = _tokenize_dataset(
             validation_dataset, tokenizer, int(config["max_length"])
         )
@@ -203,6 +189,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         bf16=True,
         tf32=True,
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="adamw_torch_fused",
         logging_strategy="steps",
         logging_steps=int(config["logging_steps"]),

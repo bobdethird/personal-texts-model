@@ -6,6 +6,7 @@ from imessage_mlx.training import encode_sft_record, render_example_parts
 
 class CharacterTokenizer:
     bos_token_id = 1
+    eos_token_id = 2
 
     def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
         assert add_special_tokens is False
@@ -44,12 +45,13 @@ def test_encoder_masks_history_and_supervises_only_target() -> None:
     tokenizer = CharacterTokenizer()
     chunks = encode_sft_record(_record(), tokenizer, max_length=512)
     expected_target = tokenizer.encode("My reply<|turn_end|>", add_special_tokens=False)
+    expected_target.append(tokenizer.eos_token_id)
 
     assert len(chunks) == 1
     chunk = chunks[0]
     supervised = [label for label in chunk["labels"] if label != -100]
     assert supervised == expected_target
-    assert chunk["labels"][:-len(expected_target)] == [-100] * (
+    assert chunk["labels"][: -len(expected_target)] == [-100] * (
         len(chunk["labels"]) - len(expected_target)
     )
     assert len(chunk["input_ids"]) == len(chunk["labels"])
@@ -59,16 +61,10 @@ def test_long_targets_are_chunked_without_dropping_or_repeating_loss_tokens() ->
     tokenizer = CharacterTokenizer()
     target_text = "abcdefghijklmnopqrstuvwxyz" * 3
     chunks = encode_sft_record(_record(target_text), tokenizer, max_length=24)
-    expected_target = tokenizer.encode(
-        f"{target_text}<|turn_end|>", add_special_tokens=False
-    )
+    expected_target = tokenizer.encode(f"{target_text}<|turn_end|>", add_special_tokens=False)
+    expected_target.append(tokenizer.eos_token_id)
 
-    supervised = [
-        label
-        for chunk in chunks
-        for label in chunk["labels"]
-        if label != -100
-    ]
+    supervised = [label for chunk in chunks for label in chunk["labels"] if label != -100]
     assert len(chunks) > 1
     assert supervised == expected_target
     assert all(len(chunk["input_ids"]) <= 24 for chunk in chunks)

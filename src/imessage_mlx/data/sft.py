@@ -12,16 +12,8 @@ SFT_FORMAT = "imessage-next-message-v1"
 def _session_id(chat_id: str, messages: list[dict[str, Any]]) -> str:
     message_ids = "\0".join(str(message["message_id"]) for message in messages)
     return sha256_text(
-        f"{chat_id}\0{messages[0]['timestamp_ns']}\0{messages[-1]['timestamp_ns']}"
-        f"\0{message_ids}"
+        f"{chat_id}\0{messages[0]['timestamp_ns']}\0{messages[-1]['timestamp_ns']}\0{message_ids}"
     )[:24]
-
-
-def _validation_session(session_id: str, validation_fraction: float) -> bool:
-    if validation_fraction <= 0:
-        return False
-    bucket = int(sha256_text(f"validation\0{session_id}")[:16], 16) / 16**16
-    return bucket < validation_fraction
 
 
 def _conversation_message(message: dict[str, Any]) -> dict[str, str]:
@@ -62,8 +54,7 @@ def prepare_sft_dataset(
         raise ValueError("max_history_messages cannot be negative")
 
     source_messages = list(read_jsonl(messages_path))
-    train_records: list[dict[str, Any]] = []
-    validation_records: list[dict[str, Any]] = []
+    session_examples: list[tuple[str, list[dict[str, Any]]]] = []
     session_count = 0
     target_count = 0
 
@@ -72,11 +63,7 @@ def prepare_sft_dataset(
     ):
         session_count += 1
         session_id = _session_id(chat_id, session)
-        destination = (
-            validation_records
-            if _validation_session(session_id, validation_fraction)
-            else train_records
-        )
+        records: list[dict[str, Any]] = []
 
         for target_position, message in enumerate(session):
             if message["sender_role"] != "me":
@@ -89,7 +76,7 @@ def prepare_sft_dataset(
             conversation = [_conversation_message(item) for item in selected]
             target_index = len(conversation) - 1
             target_count += 1
-            destination.append(
+            records.append(
                 {
                     "format": SFT_FORMAT,
                     "example_id": sha256_text(
@@ -101,6 +88,35 @@ def prepare_sft_dataset(
                     "messages": conversation,
                 }
             )
+        if records:
+            session_examples.append((session_id, records))
+
+    validation_session_ids: set[str] = set()
+    if validation_fraction > 0 and len(session_examples) > 1:
+        validation_session_count = min(
+            len(session_examples) - 1,
+            max(1, round(len(session_examples) * validation_fraction)),
+        )
+        ranked_sessions = sorted(
+            session_examples,
+            key=lambda item: sha256_text(f"validation\0{item[0]}"),
+        )
+        validation_session_ids = {
+            session_id for session_id, _records in ranked_sessions[:validation_session_count]
+        }
+
+    train_records = [
+        record
+        for session_id, records in session_examples
+        if session_id not in validation_session_ids
+        for record in records
+    ]
+    validation_records = [
+        record
+        for session_id, records in session_examples
+        if session_id in validation_session_ids
+        for record in records
+    ]
 
     write_jsonl(train_path, train_records)
     write_jsonl(validation_path, validation_records)
@@ -111,6 +127,7 @@ def prepare_sft_dataset(
         "target_outgoing_messages": target_count,
         "train_examples": len(train_records),
         "validation_examples": len(validation_records),
+        "validation_sessions": len(validation_session_ids),
         "validation_fraction": validation_fraction,
         "session_gap_minutes": session_gap_minutes,
         "max_history_messages": max_history_messages,

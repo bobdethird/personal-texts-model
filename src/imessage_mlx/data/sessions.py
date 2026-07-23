@@ -39,8 +39,7 @@ def iter_message_sessions(
         for message in ordered:
             if (
                 current
-                and int(message["timestamp_ns"]) - int(current[-1]["timestamp_ns"])
-                > session_gap_ns
+                and int(message["timestamp_ns"]) - int(current[-1]["timestamp_ns"]) > session_gap_ns
             ):
                 yield chat_id, current
                 current = []
@@ -86,8 +85,7 @@ def build_sessions(
             output_count += 1
             yield {
                 "session_id": sha256_text(
-                    f"{chat_id}\0{bucket[0]['timestamp_ns']}\0"
-                    f"{bucket[-1]['timestamp_ns']}\0{text}"
+                    f"{chat_id}\0{bucket[0]['timestamp_ns']}\0{bucket[-1]['timestamp_ns']}\0{text}"
                 )[:24],
                 "start_ns": int(bucket[0]["timestamp_ns"]),
                 "end_ns": int(bucket[-1]["timestamp_ns"]),
