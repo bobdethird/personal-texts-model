@@ -9,6 +9,7 @@ import typer
 from imessage_mlx.data.extract import extract_messages
 from imessage_mlx.data.inspect_schema import inspect_schema
 from imessage_mlx.data.sessions import build_sessions
+from imessage_mlx.data.sft import prepare_sft_dataset
 from imessage_mlx.data.snapshot import can_open_readonly, create_snapshot
 from imessage_mlx.data.table_export import export_messages_csv
 from imessage_mlx.utils import ensure_private_dir
@@ -136,5 +137,42 @@ def chunk(
         report.expanduser().resolve(),
         session_gap_minutes=session_gap_minutes,
         merge_gap_minutes=merge_gap_minutes,
+    )
+    _emit(result)
+
+
+@app.command("prepare-sft")
+def prepare_sft(
+    messages: Annotated[
+        Path,
+        typer.Option(help="Extracted message JSONL"),
+    ] = Path("work/imessages/messages.jsonl"),
+    output: Annotated[
+        Path,
+        typer.Option(help="Private directory for train, validation, and report files"),
+    ] = Path("work/imessages/sft"),
+    session_gap_minutes: Annotated[
+        int,
+        typer.Option(min=1, help="Start a new conversation after this many inactive minutes"),
+    ] = 360,
+    validation_fraction: Annotated[
+        float,
+        typer.Option(min=0.0, max=0.99, help="Fraction of whole sessions held out"),
+    ] = 0.05,
+    max_history_messages: Annotated[
+        int,
+        typer.Option(min=0, help="Maximum prior messages per target; 0 keeps all history"),
+    ] = 0,
+) -> None:
+    """Build one conversational SFT example for every message sent by me."""
+    output_path = output.expanduser().resolve()
+    result = prepare_sft_dataset(
+        messages.expanduser().resolve(),
+        output_path / "train.jsonl",
+        output_path / "validation.jsonl",
+        output_path / "report.json",
+        session_gap_minutes=session_gap_minutes,
+        validation_fraction=validation_fraction,
+        max_history_messages=max_history_messages or None,
     )
     _emit(result)
