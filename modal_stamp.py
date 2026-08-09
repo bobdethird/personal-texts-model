@@ -49,6 +49,9 @@ stamp_image = (
             "HF_HOME": "/cache/huggingface",
             "SENTENCE_TRANSFORMERS_HOME": "/cache/sentence-transformers",
             "TOKENIZERS_PARALLELISM": "false",
+            # Batched generation allocates variable-length KV caches, which
+            # fragments the default allocator badly enough to trigger OOM.
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         }
     )
     .add_local_python_source("imessage_mlx")
@@ -777,7 +780,7 @@ def _make_qwen_neutralizer(
     else:
         generation_options["do_sample"] = False
 
-    def generate_batch(batch: list[list[dict[str, str]]]) -> list[str]:
+    def generate_once(batch: list[list[dict[str, str]]]) -> list[str]:
         prompts = [
             tokenizer.apply_chat_template(
                 messages,
@@ -794,6 +797,21 @@ def _make_qwen_neutralizer(
             generated[:, prompt_tokens:],
             skip_special_tokens=True,
         )
+
+    def generate_batch(batch: list[list[dict[str, str]]]) -> list[str]:
+        # Prompt lengths vary enough that a whole batch occasionally exceeds GPU
+        # memory. Halving the batch recovers without failing the stage.
+        try:
+            return generate_once(batch)
+        except torch.OutOfMemoryError:
+            if len(batch) == 1:
+                raise
+            torch.cuda.empty_cache()
+            print(f"neutralize: splitting batch of {len(batch)} after OOM", flush=True)
+        middle = len(batch) // 2
+        first = generate_batch(batch[:middle])
+        torch.cuda.empty_cache()
+        return first + generate_batch(batch[middle:])
 
     return generate_batch
 
@@ -842,7 +860,7 @@ def _run_neutralization_core(config: dict[str, Any]) -> Any:
     limit = int(limit_value) if limit_value is not None else None
     generator = _make_qwen_neutralizer(config)
     batch_size = int(config.get("neutralize_batch_size", 32))
-    commit_every = max(1, int(config.get("neutralize_commit_every", 512)))
+    commit_every = max(1, int(config.get("neutralize_commit_every", 256)))
     split_paths = {
         "train": (config["units_train_path"], config["neutral_train_path"]),
         "validation": (
