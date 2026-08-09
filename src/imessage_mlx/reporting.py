@@ -280,3 +280,155 @@ def render_personalization_report_file(
         "output_path": str(destination),
         "examples": len(data.get("examples", [])),
     }
+
+
+def _stamp_method_names(data: dict[str, Any]) -> list[str]:
+    configured = data.get("methods")
+    if isinstance(configured, list):
+        return [str(value) for value in configured]
+    metrics = data.get("metrics")
+    if isinstance(metrics, dict):
+        return [str(value) for value in metrics]
+    examples = data.get("examples")
+    if isinstance(examples, list) and examples:
+        outputs = examples[0].get("outputs")
+        if isinstance(outputs, dict):
+            return [str(value) for value in outputs]
+    return []
+
+
+def render_stamp_report(data: dict[str, Any]) -> str:
+    """Render a private, self-contained style-transfer comparison report."""
+    examples = data.get("examples")
+    if not isinstance(examples, list) or not examples:
+        raise ValueError("STAMP results must contain at least one example")
+    methods = _stamp_method_names(data)
+    if not methods:
+        raise ValueError("STAMP results must name at least one evaluated method")
+
+    aggregate = data.get("metrics") if isinstance(data.get("metrics"), dict) else {}
+    metric_names = ("style_probability", "semantic_similarity", "fluency", "reward")
+    summary_rows = []
+    for method in methods:
+        values = aggregate.get(method, {}) if isinstance(aggregate, dict) else {}
+        cells = "".join(
+            f"<td>{_score(values.get(metric))}</td>" if isinstance(values, dict) else "<td>—</td>"
+            for metric in metric_names
+        )
+        summary_rows.append(f"<tr><th>{_escape(method)}</th>{cells}</tr>")
+
+    rendered_examples = []
+    for index, example in enumerate(examples, start=1):
+        outputs = example.get("outputs") if isinstance(example.get("outputs"), dict) else {}
+        per_method = (
+            example.get("metrics") if isinstance(example.get("metrics"), dict) else {}
+        )
+        candidates = []
+        for method in methods:
+            scores = per_method.get(method, {}) if isinstance(per_method, dict) else {}
+            score_line = " · ".join(
+                f"{metric.replace('_', ' ')} {_score(scores.get(metric))}"
+                for metric in metric_names
+                if isinstance(scores, dict) and metric in scores
+            )
+            candidates.append(
+                '<section class="stamp-candidate">'
+                f"<h3>{_escape(method)}</h3>"
+                f'<div class="stamp-message">{_escape(outputs.get(method, ""))}</div>'
+                f'<div class="stamp-scores">{_escape(score_line)}</div>'
+                "</section>"
+            )
+        rendered_examples.append(
+            '<article class="stamp-example">'
+            f'<div class="example-number">Example {index}</div>'
+            '<div class="stamp-pair">'
+            '<section><span class="section-label">Neutral source</span>'
+            f'<div class="stamp-message">{_escape(example.get("neutral", ""))}</div></section>'
+            '<section><span class="section-label">Original iMessage style</span>'
+            f'<div class="stamp-message gold">{_escape(example.get("target", ""))}</div></section>'
+            "</div>"
+            f'<div class="stamp-candidates">{"".join(candidates)}</div>'
+            "</article>"
+        )
+
+    summary = data.get("classifier_metrics")
+    classifier_note = ""
+    if isinstance(summary, dict):
+        classifier_note = (
+            "<p>Style-classifier holdout: "
+            + ", ".join(f"{_escape(key)} {_score(value)}" for key, value in summary.items())
+            + ".</p>"
+        )
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>iMessage STAMP experiment</title>
+  <style>
+    :root {{
+      color-scheme: light dark;
+      --bg:#f6f7f9; --surface:#fff; --surface2:#eef1f5; --text:#17191c;
+      --muted:#656b75; --line:#dfe3e8; --accent:#2563eb; --gold:#e8f0ff;
+    }}
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        --bg:#111315; --surface:#191c1f; --surface2:#22262a; --text:#f1f3f5;
+        --muted:#a2a9b3; --line:#32373d; --accent:#7aa7ff; --gold:#1f3b61;
+      }}
+    }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; background:var(--bg); color:var(--text);
+      font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+    main {{ width:min(1180px,calc(100% - 32px)); margin:auto; padding:48px 0 80px; }}
+    h1 {{ margin:0; font-size:clamp(28px,4vw,44px); letter-spacing:-.03em; }}
+    .intro,.stamp-scores {{ color:var(--muted); }}
+    .intro {{ max-width:760px; font-size:17px; }}
+    table {{ width:100%; border-collapse:collapse; background:var(--surface); margin:28px 0; }}
+    th,td {{ padding:12px; border:1px solid var(--line); text-align:left; }}
+    .stamp-example {{ background:var(--surface); border:1px solid var(--line);
+      border-radius:16px; padding:24px; margin:24px 0; }}
+    .example-number {{ color:var(--accent); font-weight:700; margin-bottom:14px; }}
+    .section-label {{ display:block; color:var(--muted); font-size:11px;
+      font-weight:700; letter-spacing:.06em; text-transform:uppercase; margin-bottom:7px; }}
+    .stamp-pair {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }}
+    .stamp-pair section,.stamp-candidate {{ background:var(--surface2); padding:16px;
+      border-radius:12px; min-width:0; }}
+    .stamp-message {{ white-space:pre-wrap; font-size:17px; }}
+    .stamp-message.gold {{ background:var(--gold); padding:12px; border-radius:10px; }}
+    .stamp-candidates {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+      gap:12px; margin-top:12px; }}
+    .stamp-candidate h3 {{ margin:0 0 12px; font-size:15px; }}
+    .stamp-scores {{ margin-top:16px; font-size:11px; }}
+    @media (max-width:760px) {{ .stamp-pair {{ grid-template-columns:1fr; }} }}
+  </style>
+</head>
+<body><main>
+  <h1>iMessage STAMP experiment</h1>
+  <p class="intro">Neutral drafts are rewritten in the phone owner’s texting style.
+  Automatic style scores are in-domain proxies, not proof of authorship.</p>
+  {classifier_note}
+  <table><thead><tr><th>Method</th><th>Style</th><th>Meaning</th>
+  <th>Fluency</th><th>Composite</th></tr></thead>
+  <tbody>{"".join(summary_rows)}</tbody></table>
+  {"".join(rendered_examples)}
+  <footer>Private local report · Run {_escape(data.get("run_name", "unknown"))}</footer>
+</main></body></html>
+"""
+
+
+def render_stamp_report_file(
+    input_path: str | Path,
+    output_path: str | Path,
+) -> dict[str, Any]:
+    source = Path(input_path)
+    data = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("STAMP results must be a JSON object")
+    destination = atomic_write_text(output_path, render_stamp_report(data))
+    return {
+        "input_path": str(source),
+        "output_path": str(destination),
+        "examples": len(data.get("examples", [])),
+    }

@@ -13,7 +13,7 @@ from imessage_mlx.data.sessions import build_sessions
 from imessage_mlx.data.sft import prepare_sft_dataset
 from imessage_mlx.data.snapshot import can_open_readonly, create_snapshot
 from imessage_mlx.data.table_export import export_messages_csv
-from imessage_mlx.reporting import render_personalization_report_file
+from imessage_mlx.reporting import render_personalization_report_file, render_stamp_report_file
 from imessage_mlx.retrieval import DEFAULT_EMBEDDING_MODEL, build_retrieval_index
 from imessage_mlx.style_card import run_style_card
 from imessage_mlx.utils import ensure_private_dir
@@ -201,6 +201,64 @@ def prepare_pairs(
     _emit(result)
 
 
+@app.command("prepare-stamp")
+def prepare_stamp(
+    messages: Annotated[
+        Path,
+        typer.Option(help="Timestamped extracted message JSONL"),
+    ] = Path("work/imessages/messages.jsonl"),
+    sft: Annotated[
+        Path,
+        typer.Option(help="Directory containing leakage-safe SFT train and validation files"),
+    ] = Path("work/imessages/sft"),
+    output: Annotated[
+        Path,
+        typer.Option(help="Private directory for STAMP style-unit data"),
+    ] = Path("work/imessages/stamp"),
+    judge_model: Annotated[
+        str,
+        typer.Option(help="OpenAI model used to merge continuing outgoing bubbles"),
+    ] = "gpt-5.6-luna",
+    merge_gap_minutes: Annotated[
+        float,
+        typer.Option(min=0.0, help="Maximum gap for model-judge merge candidates"),
+    ] = 2.0,
+    judge_batch_size: Annotated[
+        int,
+        typer.Option(min=1, help="Candidate chains per structured judge call"),
+    ] = 32,
+    heldout_test_fraction: Annotated[
+        float,
+        typer.Option(min=0.0, max=1.0, help="Held-out sessions reserved for final test"),
+    ] = 0.5,
+    min_chars: Annotated[
+        int | None,
+        typer.Option(min=1, help="Optional minimum characters in each source bubble"),
+    ] = None,
+) -> None:
+    """Build model-judged outgoing style units for neutralization."""
+    from imessage_mlx.data.stamp import prepare_stamp_corpus
+
+    sft_path = sft.expanduser().resolve()
+    output_path = output.expanduser().resolve()
+    result = prepare_stamp_corpus(
+        messages.expanduser().resolve(),
+        sft_path / "train.jsonl",
+        sft_path / "validation.jsonl",
+        output_path / "train.jsonl",
+        output_path / "validation.jsonl",
+        output_path / "test.jsonl",
+        output_path / "report.json",
+        judge_artifact_path=output_path / "judgments.jsonl",
+        model=judge_model,
+        merge_gap_minutes=merge_gap_minutes,
+        heldout_test_fraction=heldout_test_fraction,
+        min_chars=min_chars,
+        judge_batch_size=judge_batch_size,
+    )
+    _emit(result)
+
+
 @app.command("build-retrieval-index")
 def build_retrieval(
     pairs: Annotated[
@@ -298,6 +356,25 @@ def render_personalization_report(
 ) -> None:
     """Turn personalization sample JSON into a human-readable local report."""
     result = render_personalization_report_file(
+        results.expanduser().resolve(),
+        output.expanduser().resolve(),
+    )
+    _emit(result)
+
+
+@app.command("render-stamp-report")
+def render_stamp_comparison_report(
+    results: Annotated[
+        Path,
+        typer.Option(help="STAMP evaluation JSON downloaded from Modal"),
+    ] = Path("outputs/personal-stamp/stamp/evaluation.json"),
+    output: Annotated[
+        Path,
+        typer.Option(help="Private standalone HTML style-transfer report"),
+    ] = Path("outputs/personal-stamp/stamp/report.html"),
+) -> None:
+    """Render base, SFT, and CPO style-transfer outputs for private review."""
+    result = render_stamp_report_file(
         results.expanduser().resolve(),
         output.expanduser().resolve(),
     )

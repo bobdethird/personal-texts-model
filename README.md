@@ -165,6 +165,62 @@ uv run --extra personalize imessage-download induce-style-card
 Pass the resulting file to Modal sampling with
 `--style-card-path work/imessages/style-card.md`.
 
+## STAMP-style iMessage rewriting
+
+This is a practical adaptation of
+[ISI-NLP STAMP](https://github.com/isi-nlp/STAMP), not a byte-for-byte reproduction of
+its Llama-2/ParaNMT setup. The experiment is separate from next-message prediction and learns
+to rewrite a content-equivalent neutral draft in the phone owner's texting style. It uses only
+outgoing messages; incoming messages and conversation context are never uploaded as style data.
+
+Install the experiment dependencies and prepare leakage-safe style units:
+
+```bash
+uv sync --extra stamp
+export OPENAI_API_KEY=...
+uv run --extra stamp imessage-download prepare-stamp
+```
+
+Preparation first groups only adjacent outgoing bubbles from the same chat and session that
+arrived within two minutes with no intervening incoming message. The configured merge judge
+(default `gpt-5.6-luna`) then decides whether each candidate chain is one continuing thought
+or separate sends. Failed judge calls leave bubbles separate. Merged targets retain newlines,
+so the experiment can learn multi-bubble rhythm. Reports contain counts and hashes, never
+message text.
+
+The resulting outgoing-only style units live under `work/imessages/stamp/`. Modal uploads only
+that directory, asks Qwen to combine each unit into one fluent neutral draft, and stores the
+private neutral/original pairs in the artifact Volume. Run a minimal end-to-end check before a
+production experiment:
+
+```bash
+uv run --extra stamp modal run modal_stamp.py --run-name personal-stamp --smoke
+uv run --extra stamp modal run --detach modal_stamp.py --run-name personal-stamp
+```
+
+The production pipeline trains the original-vs-neutral style classifier, initial
+neutral-to-personal LoRA, then runs three rounds of STAMP-style hope/fear candidate generation
+and reference-free CPO. Checkpoints and evaluation JSON are stored privately under
+`/personal-stamp/stamp/` in the `imessage-sft-artifacts` Modal Volume.
+Modern TRL no longer ships `CPOTrainer`, while its old CPO release predates Qwen 3.
+The pipeline therefore implements the same reference-free sigmoid CPO objective directly on
+Transformers and uses current TRL only for initial SFT.
+
+After downloading the evaluation JSON, render the private comparison report:
+
+```bash
+uv run --extra stamp modal volume get imessage-sft-artifacts \
+  /personal-stamp/stamp/evaluation/evaluation.json \
+  outputs/personal-stamp-evaluation.json
+uv run imessage-download render-stamp-report \
+  --results outputs/personal-stamp-evaluation.json \
+  --output outputs/personal-stamp-report.html
+```
+
+Automatic style probability is an in-domain classifier proxy, not proof that a person authored
+the output. Semantic similarity, normalized base-model likelihood, length diagnostics, and
+structural-anchoring measurements should be interpreted together with the example report.
+
 ## Train on Modal (A100)
 
 Install the optional training tools and authenticate Modal:
