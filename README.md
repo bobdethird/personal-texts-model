@@ -200,7 +200,7 @@ uv run --extra stamp modal run --detach modal_stamp.py --run-name personal-stamp
 
 The production pipeline trains the original-vs-neutral style classifier, initial
 neutral-to-personal LoRA, then runs three rounds of STAMP-style hope/fear candidate generation
-and reference-free CPO. Checkpoints and evaluation JSON are stored privately under
+and reference-free CPO on one `A100-40GB`. Checkpoints and evaluation JSON are stored privately under
 `/personal-stamp/stamp/` in the `imessage-sft-artifacts` Modal Volume.
 Modern TRL no longer ships `CPOTrainer`, while its old CPO release predates Qwen 3.
 The pipeline therefore implements the same reference-free sigmoid CPO objective directly on

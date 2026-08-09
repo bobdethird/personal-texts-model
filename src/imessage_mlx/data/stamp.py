@@ -705,12 +705,6 @@ def prepare_stamp_corpus(
         merge_gap_minutes=merge_gap_minutes,
         min_chars=min_chars,
     )
-    candidates = [
-        run.candidate
-        for plan in plans
-        for run in plan.runs
-        if run.candidate is not None
-    ]
 
     train_sessions = _load_sft_sessions(sft_train_path)
     heldout_sessions = _load_sft_sessions(sft_validation_path)
@@ -718,14 +712,17 @@ def prepare_stamp_corpus(
     if overlap:
         raise ValueError("SFT train and validation files contain overlapping session IDs")
     known_sessions = train_sessions | heldout_sessions
-    missing_sessions = sorted(
-        plan.session_id for plan in plans if plan.session_id not in known_sessions
-    )
-    if missing_sessions:
-        raise ValueError(
-            "Source sessions are absent from the SFT train/validation files: "
-            + ", ".join(missing_sessions)
-        )
+    # Sessions absent from the current SFT split are dropped so preparation can
+    # follow an older extract or discard SFT-ineligible sessions without failing.
+    kept_plans = [plan for plan in plans if plan.session_id in known_sessions]
+    dropped_unknown_sessions = len(plans) - len(kept_plans)
+    plans = kept_plans
+    candidates = [
+        run.candidate
+        for plan in plans
+        for run in plan.runs
+        if run.candidate is not None
+    ]
 
     active_judge: ModelJudge = judge or OpenAIModelJudge(model=model)
     if judge_artifact_path is None:
@@ -778,6 +775,7 @@ def prepare_stamp_corpus(
         "format": STAMP_FORMAT,
         "input_messages": len(source_messages),
         **preparation_stats,
+        "dropped_unknown_sessions": dropped_unknown_sessions,
         "candidate_chains": len(candidates),
         "candidate_boundaries": sum(len(candidate.bubbles) - 1 for candidate in candidates),
         "merged_boundaries": merged_boundaries,

@@ -60,9 +60,9 @@ _VOLUMES = {
 }
 _GPU_FUNCTION_OPTIONS: dict[str, Any] = {
     "image": stamp_image,
-    "gpu": "A100-80GB",
+    "gpu": "A100-40GB",
     "cpu": 8,
-    "memory": 49_152,
+    "memory": 32_768,
     "timeout": 24 * 60 * 60,
     "startup_timeout": 20 * 60,
     "retries": modal.Retries(initial_delay=2.0, max_retries=2),
