@@ -26,7 +26,15 @@ entire TARGET burst into one plain, conventional English draft while preserving 
 intent, level of certainty, negation, number, named entity, placeholder, and
 meaningful detail. Remove idiosyncratic texting style, slang, abbreviations,
 emoji, expressive punctuation, and stylistic bubble boundaries. Do not answer the
-message or add information."""
+message or add information.
+
+Write the draft as the sender speaking, in the same grammatical person as the
+TARGET. Keep first-person pronouns first person and keep questions as questions
+addressed to the reader. Never describe the message from the outside: do not
+write "the sender asks", "they state that", or any other reported speech.
+
+The draft must be a genuine rewrite. If the TARGET is already plain English,
+still produce a neutral phrasing of it rather than copying it back verbatim."""
 
 DEFAULT_USER_TEMPLATE = """\
 Neutralize the complete thought represented by the {bubble_count} TARGET bubble(s).
@@ -54,6 +62,19 @@ _NUMBER_RE = re.compile(
     re.IGNORECASE,
 )
 _WORD_RE = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)?")
+_FIRST_PERSON = frozenset(
+    {"i", "id", "ill", "im", "ive", "me", "mine", "my", "myself", "our", "ours", "us", "we"}
+)
+_REPORTED_SPEECH_RE = re.compile(
+    r"\b(?:"
+    r"the (?:sender|speaker|author|writer|message|user|individual|person)|"
+    r"this (?:message|response|text)|"
+    r"(?:asks|asking|states|stating|says|saying|mentions|mentioning|indicates|"
+    r"indicating|explains|explaining|notes|noting|requests|requesting)"
+    r"\s+(?:if|whether|that|for)"
+    r")\b",
+    re.IGNORECASE,
+)
 _NEGATIONS = frozenset(
     {
         "ain't",
@@ -114,6 +135,8 @@ class NeutralValidationConfig:
     max_length_ratio: float = 2.5
     max_characters: int | None = None
     min_semantic_similarity: float | None = None
+    require_person_preserved: bool = True
+    reject_unchanged: bool = True
 
     def __post_init__(self) -> None:
         if self.min_length_ratio <= 0:
@@ -255,6 +278,27 @@ def negation_count(text: str) -> int:
     return sum(token in _NEGATIONS for token in _WORD_RE.findall(normalized))
 
 
+def has_first_person(text: str) -> bool:
+    """Report whether the text speaks in first person."""
+
+    normalized = text.lower().replace("’", "")
+    return any(
+        token.replace("'", "") in _FIRST_PERSON for token in _WORD_RE.findall(normalized)
+    )
+
+
+def is_reported_speech(text: str) -> bool:
+    """Report whether the text describes the message from the outside."""
+
+    return bool(_REPORTED_SPEECH_RE.search(text))
+
+
+def _comparable_text(text: str) -> str:
+    """Collapse text to letters, digits, and single spaces for copy detection."""
+
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text.lower()).split())
+
+
 def validate_neutral(
     original_bubbles: str | Sequence[str],
     neutral_bubbles: str | Sequence[str],
@@ -279,6 +323,19 @@ def validate_neutral(
         errors.append("negation_changed")
     if placeholder_counts(original_text) != placeholder_counts(neutral_text):
         errors.append("placeholders_changed")
+    if rules.require_person_preserved:
+        # Dropping the sender's voice, or narrating the message from outside,
+        # breaks the assumption that the neutral draft is the same utterance.
+        if has_first_person(original_text) and not has_first_person(neutral_text):
+            errors.append("person_changed")
+        if is_reported_speech(neutral_text) and not is_reported_speech(original_text):
+            errors.append("reported_speech")
+    if rules.reject_unchanged and _comparable_text(original_text) == _comparable_text(
+        neutral_text
+    ):
+        # An unchanged draft preserves content perfectly but carries no style
+        # signal, so it would only teach the model to copy its input.
+        errors.append("unchanged_text")
 
     source_length = max(1, len(original_text.strip()))
     length_ratio = len(neutral_text.strip()) / source_length

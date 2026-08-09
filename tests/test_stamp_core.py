@@ -126,6 +126,45 @@ def test_neutral_validation_checks_content_invariants() -> None:
     } <= set(invalid.errors)
 
 
+def test_neutral_validation_rejects_lost_first_person_and_reported_speech() -> None:
+    lost_person = validate_neutral(
+        ["So like I'm not really up that much"],
+        ["The overall change is not significant"],
+    )
+    assert "person_changed" in lost_person.errors
+
+    narrated = validate_neutral(
+        ["Sarah can I have money"],
+        ["Sarah, the sender asks if he can have money"],
+    )
+    assert "reported_speech" in narrated.errors
+
+    kept = validate_neutral(
+        ["So like I'm not really up that much"],
+        ["I have not gained very much"],
+    )
+    assert kept.valid
+
+
+def test_neutral_validation_rejects_copies_of_the_original() -> None:
+    copied = validate_neutral(["Collin has your card"], ["Collin has your card"])
+    assert copied.errors == ("unchanged_text",)
+
+    # Punctuation and casing alone are not a rewrite.
+    restyled = validate_neutral(["on the elevator"], ["On the elevator."])
+    assert "unchanged_text" in restyled.errors
+
+    rewritten = validate_neutral(["on the elevator"], ["I am in the elevator."])
+    assert rewritten.valid
+
+    allowed = validate_neutral(
+        ["Collin has your card"],
+        ["Collin has your card"],
+        config=NeutralValidationConfig(reject_unchanged=False),
+    )
+    assert allowed.valid
+
+
 def test_neutral_validation_optional_semantic_threshold() -> None:
     config = NeutralValidationConfig(min_semantic_similarity=0.9)
     missing = validate_neutral("hello there", "hello", config=config)
