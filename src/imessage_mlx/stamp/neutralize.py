@@ -16,7 +16,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from imessage_mlx.utils import read_jsonl, sha256_text, write_json, write_jsonl
+from imessage_mlx.utils import extend_jsonl, read_jsonl, sha256_text, write_json
 
 NEUTRAL_PAIR_FORMAT = "stamp-neutral-pair-v1"
 
@@ -361,29 +361,63 @@ def _record_context(record: Mapping[str, Any]) -> list[str]:
     return []
 
 
+@dataclass
+class _PendingUnit:
+    """One record awaiting an accepted neutralization."""
+
+    pair_id: str
+    source_id: str
+    split: str | None
+    original: list[str]
+    context: list[str]
+    messages: list[dict[str, str]]
+    errors: list[str]
+
+
+def _chunked(items: Iterable[Any], size: int) -> Iterable[list[Any]]:
+    chunk: list[Any] = []
+    for item in items:
+        chunk.append(item)
+        if len(chunk) == size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
 def run_neutralization(
     records: Iterable[Mapping[str, Any]],
     output_path: str | Path,
-    generator: Callable[[list[dict[str, str]]], str | Mapping[str, Any] | Sequence[str]],
+    generator: Callable[[list[dict[str, str]]], str | Mapping[str, Any] | Sequence[str]]
+    | None = None,
     *,
+    batch_generator: Callable[[list[list[dict[str, str]]]], Sequence[Any]] | None = None,
+    batch_size: int = 1,
     prompt_config: NeutralizationPromptConfig | None = None,
     validation_config: NeutralValidationConfig | None = None,
     semantic_scorer: Callable[[str, str], float] | None = None,
     max_attempts: int = 2,
     report_path: str | Path | None = None,
+    on_progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Run an injected generator, checkpointing each accepted pair atomically.
+    """Run an injected generator, checkpointing accepted pairs as they are produced.
 
     Existing valid pair IDs in ``output_path`` are skipped, so an interrupted run
-    can safely restart with the same source records.
+    can safely restart with the same source records. Supplying ``batch_generator``
+    lets the caller neutralize ``batch_size`` records per model call.
     """
 
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    if generator is None and batch_generator is None:
+        raise ValueError("Provide either generator or batch_generator")
+
     destination = Path(output_path)
-    accepted = list(read_jsonl(destination)) if destination.is_file() else []
+    existing = list(read_jsonl(destination)) if destination.is_file() else []
     completed: set[str] = set()
-    for pair in accepted:
+    for pair in existing:
         if pair.get("format") != NEUTRAL_PAIR_FORMAT:
             raise ValueError(f"Unsupported neutral pair format {pair.get('format')!r}")
         pair_id = str(pair.get("pair_id", ""))
@@ -391,63 +425,113 @@ def run_neutralization(
             raise ValueError("Existing neutral pairs must have unique nonempty pair IDs")
         completed.add(pair_id)
 
+    def generate_many(prompts: list[list[dict[str, str]]]) -> list[Any]:
+        if batch_generator is not None:
+            outputs = list(batch_generator(prompts))
+            if len(outputs) != len(prompts):
+                raise ValueError("batch_generator returned the wrong number of outputs")
+            return outputs
+        assert generator is not None
+        return [generator(prompt) for prompt in prompts]
+
+    pair_count = len(existing)
     skipped = generated = 0
     failures: list[dict[str, Any]] = []
-    for record in records:
-        original = _record_bubbles(record)
-        source_id = str(record.get("pair_id") or record.get("source_id") or "")
-        pair_id = source_id or sha256_text(json.dumps(original, ensure_ascii=False))[:24]
-        if pair_id in completed:
-            skipped += 1
-            continue
-        context = _record_context(record)
-        messages = build_neutralization_messages(
-            original,
-            context_bubbles=context,
-            config=prompt_config,
-        )
-        attempt_errors: list[str] = []
-        for _attempt in range(max_attempts):
-            try:
-                raw_output = generator(messages)
-                neutral = parse_neutral_output(raw_output)
-                validation = validate_neutral(
+
+    def pending_units() -> Iterable[_PendingUnit]:
+        nonlocal skipped
+        for record in records:
+            original = _record_bubbles(record)
+            source_id = str(record.get("pair_id") or record.get("source_id") or "")
+            pair_id = source_id or sha256_text(json.dumps(original, ensure_ascii=False))[:24]
+            if pair_id in completed:
+                skipped += 1
+                continue
+            context = _record_context(record)
+            yield _PendingUnit(
+                pair_id=pair_id,
+                source_id=source_id,
+                split=str(record["split"]) if "split" in record else None,
+                original=original,
+                context=context,
+                messages=build_neutralization_messages(
                     original,
-                    neutral,
-                    config=validation_config,
-                    semantic_scorer=semantic_scorer,
-                )
-                if not validation.valid:
-                    attempt_errors.extend(validation.errors)
-                    continue
-                pair = make_neutral_pair(
-                    pair_id=pair_id,
-                    source_id=source_id or None,
-                    split=str(record["split"]) if "split" in record else None,
-                    original_bubbles=original,
-                    neutral_bubbles=neutral,
                     context_bubbles=context,
-                    validation=validation,
-                )
-                accepted.append(pair)
-                completed.add(pair_id)
-                write_jsonl(destination, accepted)
-                generated += 1
+                    config=prompt_config,
+                ),
+                errors=[],
+            )
+
+    for chunk in _chunked(pending_units(), batch_size):
+        remaining = list(chunk)
+        chunk_pairs: list[dict[str, Any]] = []
+        for _attempt in range(max_attempts):
+            if not remaining:
                 break
+            try:
+                outputs = generate_many([unit.messages for unit in remaining])
             except (TypeError, ValueError, json.JSONDecodeError) as error:
-                attempt_errors.append(str(error))
-        else:
-            failures.append(
+                for unit in remaining:
+                    unit.errors.append(str(error))
+                continue
+            retry: list[_PendingUnit] = []
+            for unit, raw_output in zip(remaining, outputs, strict=True):
+                try:
+                    neutral = parse_neutral_output(raw_output)
+                    validation = validate_neutral(
+                        unit.original,
+                        neutral,
+                        config=validation_config,
+                        semantic_scorer=semantic_scorer,
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    unit.errors.append(str(error))
+                    retry.append(unit)
+                    continue
+                if not validation.valid:
+                    unit.errors.extend(validation.errors)
+                    retry.append(unit)
+                    continue
+                chunk_pairs.append(
+                    make_neutral_pair(
+                        pair_id=unit.pair_id,
+                        source_id=unit.source_id or None,
+                        split=unit.split,
+                        original_bubbles=unit.original,
+                        neutral_bubbles=neutral,
+                        context_bubbles=unit.context,
+                        validation=validation,
+                    )
+                )
+                completed.add(unit.pair_id)
+            remaining = retry
+
+        failures.extend(
+            {
+                "pair_id": unit.pair_id,
+                "errors": list(dict.fromkeys(unit.errors)) or ["generation_failed"],
+            }
+            for unit in remaining
+        )
+        if chunk_pairs:
+            # Appending keeps checkpoint cost flat as the output file grows.
+            extend_jsonl(destination, chunk_pairs)
+            generated += len(chunk_pairs)
+            pair_count += len(chunk_pairs)
+        if on_progress is not None:
+            on_progress(
                 {
-                    "pair_id": pair_id,
-                    "errors": list(dict.fromkeys(attempt_errors)) or ["generation_failed"],
+                    "pairs": pair_count,
+                    "generated": generated,
+                    "skipped_existing": skipped,
+                    "failed": len(failures),
                 }
             )
 
     summary = {
         "format": NEUTRAL_PAIR_FORMAT,
         "output_path": str(destination),
-        "pairs": len(accepted),
+        "pairs": pair_count,
         "generated": generated,
         "skipped_existing": skipped,
         "failed": len(failures),

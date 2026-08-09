@@ -159,6 +159,91 @@ def test_neutralization_runner_resumes_and_writes_private_file(tmp_path: Path) -
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
 
+def test_batched_neutralization_groups_records_into_one_call(tmp_path: Path) -> None:
+    output = tmp_path / "private" / "pairs.jsonl"
+    batch_sizes: list[int] = []
+    progress: list[int] = []
+
+    def batch_generator(prompts: list[list[dict[str, str]]]) -> list[str]:
+        batch_sizes.append(len(prompts))
+        return ['{"neutral_bubbles":["I cannot come at 7."]}'] * len(prompts)
+
+    source = [
+        {"pair_id": f"p{index}", "reply": "cant come at 7", "split": "train"}
+        for index in range(5)
+    ]
+    summary = run_neutralization(
+        source,
+        output,
+        batch_generator=batch_generator,
+        batch_size=2,
+        on_progress=lambda state: progress.append(int(state["generated"])),
+    )
+
+    assert summary["generated"] == 5
+    assert batch_sizes == [2, 2, 1]
+    assert progress == [2, 4, 5]
+    assert len(list(read_jsonl(output))) == 5
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
+def test_batched_neutralization_retries_only_the_invalid_records(tmp_path: Path) -> None:
+    output = tmp_path / "pairs.jsonl"
+    seen: list[int] = []
+
+    def batch_generator(prompts: list[list[dict[str, str]]]) -> list[str]:
+        seen.append(len(prompts))
+        # The first pass drops a required number from one record, so only that
+        # record should be retried.
+        if len(seen) == 1:
+            return [
+                '{"neutral_bubbles":["I cannot come at 7."]}',
+                '{"neutral_bubbles":["I cannot come."]}',
+            ]
+        return ['{"neutral_bubbles":["I cannot come at 7."]}'] * len(prompts)
+
+    source = [
+        {"pair_id": "p0", "reply": "cant come at 7", "split": "train"},
+        {"pair_id": "p1", "reply": "cant come at 7", "split": "train"},
+    ]
+    summary = run_neutralization(
+        source,
+        output,
+        batch_generator=batch_generator,
+        batch_size=2,
+    )
+
+    assert seen == [2, 1]
+    assert summary["generated"] == 2
+    assert summary["failed"] == 0
+
+
+def test_batched_neutralization_records_persistently_invalid_records(tmp_path: Path) -> None:
+    output = tmp_path / "pairs.jsonl"
+
+    def batch_generator(prompts: list[list[dict[str, str]]]) -> list[str]:
+        return ['{"neutral_bubbles":["I cannot come."]}'] * len(prompts)
+
+    source = [{"pair_id": "p0", "reply": "cant come at 7", "split": "train"}]
+    summary = run_neutralization(
+        source,
+        output,
+        batch_generator=batch_generator,
+        batch_size=4,
+        max_attempts=2,
+    )
+
+    assert summary["generated"] == 0
+    assert summary["failed"] == 1
+    assert summary["failures"][0]["pair_id"] == "p0"
+    assert not output.exists()
+
+
+def test_neutralization_requires_a_generator(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="generator"):
+        run_neutralization([], tmp_path / "pairs.jsonl")
+
+
 def test_classifier_examples_are_balanced_and_metrics_include_auc() -> None:
     examples = build_classifier_examples([_neutral_pair()])
     assert [example["label"] for example in examples] == [1, 0]

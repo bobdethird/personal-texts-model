@@ -7,6 +7,7 @@ import json
 import re
 import sys
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -732,7 +733,11 @@ def _neutralization_records(path: str, limit: int | None) -> list[dict[str, Any]
     return normalized
 
 
-def _make_qwen_neutralizer(config: Mapping[str, Any]) -> Callable[[list[dict[str, str]]], str]:
+def _make_qwen_neutralizer(
+    config: Mapping[str, Any],
+) -> Callable[[list[list[dict[str, str]]]], list[str]]:
+    """Build a batched neutralizer so one forward pass covers many records."""
+
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -740,6 +745,8 @@ def _make_qwen_neutralizer(config: Mapping[str, Any]) -> Callable[[list[dict[str
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Decoder-only batching requires left padding so completions start together.
+    tokenizer.padding_side = "left"
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         dtype=torch.bfloat16,
@@ -754,36 +761,70 @@ def _make_qwen_neutralizer(config: Mapping[str, Any]) -> Callable[[list[dict[str
     temperature = float(config.get("neutralize_temperature", 0.2))
     max_new_tokens = int(config.get("neutralize_max_new_tokens", 512))
 
-    def generate(messages: list[dict[str, str]]) -> str:
-        # The preceding accepted pair is durable before the next generation starts.
-        artifact_volume.commit()
-        prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
+    generation_options: dict[str, Any] = {
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+    if temperature > 0:
+        generation_options.update(
+            {
+                "do_sample": True,
+                "temperature": temperature,
+                "top_p": float(config.get("neutralize_top_p", 0.9)),
+            }
         )
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        generation_options: dict[str, Any] = {
-            "max_new_tokens": max_new_tokens,
-            "pad_token_id": tokenizer.pad_token_id,
-            "eos_token_id": tokenizer.eos_token_id,
-        }
-        if temperature > 0:
-            generation_options.update(
-                {
-                    "do_sample": True,
-                    "temperature": temperature,
-                    "top_p": float(config.get("neutralize_top_p", 0.9)),
-                }
+    else:
+        generation_options["do_sample"] = False
+
+    def generate_batch(batch: list[list[dict[str, str]]]) -> list[str]:
+        prompts = [
+            tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
             )
-        else:
-            generation_options["do_sample"] = False
+            for messages in batch
+        ]
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
         with torch.inference_mode():
             generated = model.generate(**inputs, **generation_options)
         prompt_tokens = inputs["input_ids"].shape[1]
-        return tokenizer.decode(generated[0, prompt_tokens:], skip_special_tokens=True)
+        return tokenizer.batch_decode(
+            generated[:, prompt_tokens:],
+            skip_special_tokens=True,
+        )
 
-    return generate
+    return generate_batch
+
+
+def _make_neutralize_reporter(
+    *,
+    split: str,
+    total: int,
+    commit_every: int,
+) -> Callable[[Mapping[str, Any]], None]:
+    """Commit the artifact volume periodically and log neutralization throughput."""
+
+    started = time.monotonic()
+    state = {"last_commit": 0}
+
+    def report(progress: Mapping[str, Any]) -> None:
+        done = int(progress["generated"]) + int(progress["skipped_existing"])
+        if done - state["last_commit"] < commit_every and done < total:
+            return
+        state["last_commit"] = done
+        artifact_volume.commit()
+        elapsed = max(time.monotonic() - started, 1e-6)
+        rate = int(progress["generated"]) / elapsed
+        remaining = f"{(total - done) / rate / 60:.1f} min" if rate > 0 else "unknown"
+        print(
+            f"neutralize[{split}]: {done}/{total} "
+            f"({rate:.1f}/s, ~{remaining} left, failed={progress['failed']})",
+            flush=True,
+        )
+
+    return report
 
 
 def _run_neutralization_core(config: dict[str, Any]) -> Any:
@@ -800,6 +841,8 @@ def _run_neutralization_core(config: dict[str, Any]) -> Any:
     limit_value = config.get("neutralize_limit", config.get("max_examples"))
     limit = int(limit_value) if limit_value is not None else None
     generator = _make_qwen_neutralizer(config)
+    batch_size = int(config.get("neutralize_batch_size", 32))
+    commit_every = max(1, int(config.get("neutralize_commit_every", 512)))
     split_paths = {
         "train": (config["units_train_path"], config["neutral_train_path"]),
         "validation": (
@@ -808,6 +851,7 @@ def _run_neutralization_core(config: dict[str, Any]) -> Any:
         ),
         "test": (config["units_test_path"], config["neutral_test_path"]),
     }
+    supports_batching = "batch_generator" in parameters
     results: dict[str, Any] = {}
     for split, (source_path, output_path) in split_paths.items():
         source = Path(str(source_path))
@@ -816,13 +860,27 @@ def _run_neutralization_core(config: dict[str, Any]) -> Any:
                 raise FileNotFoundError(f"Missing prepared training units: {source}")
             continue
         records = _neutralization_records(str(source), limit)
-        results[split] = function(
-            records=records,
-            output_path=str(output_path),
-            generator=generator,
-            max_attempts=int(config.get("neutralize_max_attempts", 2)),
-            report_path=f"{config['neutral_dir']}/{split}-report.json",
-        )
+        call_options: dict[str, Any] = {
+            "records": records,
+            "output_path": str(output_path),
+            "max_attempts": int(config.get("neutralize_max_attempts", 2)),
+            "report_path": f"{config['neutral_dir']}/{split}-report.json",
+        }
+        if supports_batching:
+            call_options.update(
+                {
+                    "batch_generator": generator,
+                    "batch_size": batch_size,
+                    "on_progress": _make_neutralize_reporter(
+                        split=split,
+                        total=len(records),
+                        commit_every=commit_every,
+                    ),
+                }
+            )
+        else:
+            call_options["generator"] = lambda messages: generator([messages])[0]
+        results[split] = function(**call_options)
         artifact_volume.commit()
     return {"splits": results, "neutral_dir": config["neutral_dir"]}
 
