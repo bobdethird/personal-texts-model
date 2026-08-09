@@ -146,23 +146,25 @@ def test_neutral_validation_rejects_lost_first_person_and_reported_speech() -> N
     assert kept.valid
 
 
-def test_neutral_validation_rejects_copies_of_the_original() -> None:
+def test_neutral_validation_reports_copies_without_rejecting_them() -> None:
     copied = validate_neutral(["Collin has your card"], ["Collin has your card"])
-    assert copied.errors == ("unchanged_text",)
+    assert copied.valid
+    assert copied.unchanged
 
     # Punctuation and casing alone are not a rewrite.
     restyled = validate_neutral(["on the elevator"], ["On the elevator."])
-    assert "unchanged_text" in restyled.errors
+    assert restyled.unchanged
 
     rewritten = validate_neutral(["on the elevator"], ["I am in the elevator."])
     assert rewritten.valid
+    assert not rewritten.unchanged
 
-    allowed = validate_neutral(
+    strict = validate_neutral(
         ["Collin has your card"],
         ["Collin has your card"],
-        config=NeutralValidationConfig(reject_unchanged=False),
+        config=NeutralValidationConfig(reject_unchanged=True),
     )
-    assert allowed.valid
+    assert strict.errors == ("unchanged_text",)
 
 
 def test_neutral_validation_optional_semantic_threshold() -> None:
@@ -270,7 +272,7 @@ def test_batched_neutralization_varies_retries_and_keeps_rejected_drafts(
     ) -> list[str]:
         attempts.append(attempt)
         if attempt == 0:
-            return ['{"neutral_bubbles":["cant come at 7"]}'] * len(prompts)
+            return ['{"neutral_bubbles":["I cannot come at 8."]}'] * len(prompts)
         return ['{"neutral_bubbles":["I cannot come at 7."]}'] * len(prompts)
 
     source = [{"pair_id": "p0", "reply": "cant come at 7", "split": "train"}]
@@ -290,7 +292,7 @@ def test_failures_record_the_rejected_draft(tmp_path: Path) -> None:
     output = tmp_path / "pairs.jsonl"
 
     def batch_generator(prompts: list[list[dict[str, str]]]) -> list[str]:
-        return ['{"neutral_bubbles":["cant come at 7"]}'] * len(prompts)
+        return ['{"neutral_bubbles":["I cannot come at 7 and 8."]}'] * len(prompts)
 
     summary = run_neutralization(
         [{"pair_id": "p0", "reply": "cant come at 7", "split": "train"}],
@@ -301,9 +303,50 @@ def test_failures_record_the_rejected_draft(tmp_path: Path) -> None:
     )
 
     failure = summary["failures"][0]
-    assert failure["errors"] == ["unchanged_text"]
+    assert "numbers_changed" in failure["errors"]
     assert failure["original"] == ["cant come at 7"]
-    assert failure["rejected"] == ["cant come at 7"]
+    assert failure["rejected"] == ["I cannot come at 7 and 8."]
+
+
+def test_unchanged_pairs_are_kept_but_capped(tmp_path: Path) -> None:
+    output = tmp_path / "pairs.jsonl"
+
+    def batch_generator(prompts: list[list[dict[str, str]]]) -> list[str]:
+        outputs = []
+        for prompt in prompts:
+            target = json.loads(prompt[-1]["content"].split("TARGET:\n")[1].split("\n\n")[0])
+            reply = target[0]
+            # Half the corpus is already neutral and echoes back unchanged.
+            draft = reply if reply.startswith("plain") else reply.replace("msg", "message")
+            outputs.append(json.dumps({"neutral_bubbles": [draft]}))
+        return outputs
+
+    source = [
+        {
+            "pair_id": f"p{index}",
+            "reply": ("plain" if index % 2 else "msg") + f" {chr(97 + index)}",
+            "split": "train",
+        }
+        for index in range(20)
+    ]
+    summary = run_neutralization(
+        source,
+        output,
+        batch_generator=batch_generator,
+        batch_size=4,
+        max_attempts=1,
+        max_unchanged_ratio=0.25,
+    )
+
+    stored = [json.loads(line) for line in output.read_text().splitlines()]
+    unchanged = [pair for pair in stored if pair["validation"]["unchanged"]]
+
+    assert len(stored) == summary["generated"]
+    assert len(unchanged) == summary["unchanged_pairs"]
+    # Every real rewrite is kept, while copies are held to the configured share.
+    assert summary["generated"] - len(unchanged) == 10
+    assert 0 < len(unchanged) <= 0.25 * len(stored) + 1
+    assert all("unchanged_over_cap" in f["errors"] for f in summary["failures"])
 
 
 def test_batched_neutralization_records_persistently_invalid_records(tmp_path: Path) -> None:

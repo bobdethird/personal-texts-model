@@ -886,6 +886,7 @@ def _run_neutralization_core(config: dict[str, Any]) -> Any:
             "records": records,
             "output_path": str(output_path),
             "max_attempts": int(config.get("neutralize_max_attempts", 2)),
+            "max_unchanged_ratio": float(config.get("neutralize_max_unchanged_ratio", 0.05)),
             "report_path": f"{config['neutral_dir']}/{split}-report.json",
         }
         if supports_batching:

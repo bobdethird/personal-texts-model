@@ -137,7 +137,10 @@ class NeutralValidationConfig:
     max_characters: int | None = None
     min_semantic_similarity: float | None = None
     require_person_preserved: bool = True
-    reject_unchanged: bool = True
+    # An unchanged draft is reported rather than rejected: some messages are
+    # already plain English, and a few such pairs teach the model restraint.
+    # Callers bound how many they keep via ``max_unchanged_ratio``.
+    reject_unchanged: bool = False
 
     def __post_init__(self) -> None:
         if self.min_length_ratio <= 0:
@@ -158,6 +161,7 @@ class NeutralValidationResult:
     errors: tuple[str, ...]
     length_ratio: float
     semantic_similarity: float | None
+    unchanged: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -165,6 +169,7 @@ class NeutralValidationResult:
             "errors": list(self.errors),
             "length_ratio": self.length_ratio,
             "semantic_similarity": self.semantic_similarity,
+            "unchanged": self.unchanged,
         }
 
 
@@ -331,11 +336,8 @@ def validate_neutral(
             errors.append("person_changed")
         if is_reported_speech(neutral_text) and not is_reported_speech(original_text):
             errors.append("reported_speech")
-    if rules.reject_unchanged and _comparable_text(original_text) == _comparable_text(
-        neutral_text
-    ):
-        # An unchanged draft preserves content perfectly but carries no style
-        # signal, so it would only teach the model to copy its input.
+    unchanged = _comparable_text(original_text) == _comparable_text(neutral_text)
+    if unchanged and rules.reject_unchanged:
         errors.append("unchanged_text")
 
     source_length = max(1, len(original_text.strip()))
@@ -361,6 +363,7 @@ def validate_neutral(
         errors=tuple(dict.fromkeys(errors)),
         length_ratio=length_ratio,
         semantic_similarity=semantic_similarity,
+        unchanged=unchanged,
     )
 
 
@@ -433,6 +436,18 @@ class _PendingUnit:
     rejected: list[str]
 
 
+def _unchanged_has_room(unchanged: int, accepted: int, ratio: float) -> bool:
+    """Report whether one more unchanged pair stays within the allowed share."""
+
+    if ratio >= 1:
+        return True
+    if ratio <= 0:
+        return False
+    # The share is meaningless before anything is accepted, so always allow one
+    # through; otherwise a corpus of already-neutral text could never start.
+    return (unchanged + 1) <= max(1.0, ratio * (accepted + 1))
+
+
 def _accepts_attempt(function: Callable[..., Any]) -> bool:
     try:
         parameters = inspect.signature(function).parameters
@@ -467,6 +482,7 @@ def run_neutralization(
     validation_config: NeutralValidationConfig | None = None,
     semantic_scorer: Callable[[str, str], float] | None = None,
     max_attempts: int = 2,
+    max_unchanged_ratio: float = 0.05,
     report_path: str | Path | None = None,
     on_progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -479,6 +495,8 @@ def run_neutralization(
 
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
+    if not 0 <= max_unchanged_ratio <= 1:
+        raise ValueError("max_unchanged_ratio must be in [0, 1]")
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
     if generator is None and batch_generator is None:
@@ -513,6 +531,9 @@ def run_neutralization(
 
     pair_count = len(existing)
     skipped = generated = 0
+    unchanged_count = sum(
+        1 for record in existing if record.get("validation", {}).get("unchanged")
+    )
     failures: list[dict[str, Any]] = []
 
     def pending_units() -> Iterable[_PendingUnit]:
@@ -573,6 +594,17 @@ def run_neutralization(
                     unit.rejected.append(" / ".join(neutral))
                     retry.append(unit)
                     continue
+                if validation.unchanged and not _unchanged_has_room(
+                    unchanged_count, pair_count + len(chunk_pairs), max_unchanged_ratio
+                ):
+                    # A later attempt samples more widely and often finds a real
+                    # rewrite, so spend the remaining attempts before giving up.
+                    unit.errors.append("unchanged_over_cap")
+                    unit.rejected.append(" / ".join(neutral))
+                    retry.append(unit)
+                    continue
+                if validation.unchanged:
+                    unchanged_count += 1
                 chunk_pairs.append(
                     make_neutral_pair(
                         pair_id=unit.pair_id,
@@ -618,6 +650,7 @@ def run_neutralization(
         "generated": generated,
         "skipped_existing": skipped,
         "failed": len(failures),
+        "unchanged_pairs": unchanged_count,
         "failures": failures,
     }
     if report_path is not None:
