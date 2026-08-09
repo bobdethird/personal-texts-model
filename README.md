@@ -84,8 +84,14 @@ Every assistant turn is a loss target. User turns stay in the transcript as cont
 with labels set to `-100`, so no incoming message token contributes to training loss.
 Because the model is causal, supervising all of your turns in one session gives each
 turn the same conditional history as emitting a separate example per message, without
-re-encoding the shared prefix over and over. Group-chat user messages retain their
-pseudonymous participant as input-only metadata.
+re-encoding the shared prefix over and over. Group-chat user messages retain a short
+pseudonymous participant prefix as input-only metadata.
+
+Export placeholders such as `<|attachment|>` are stripped during preparation and
+messages that become empty are dropped, so the model never learns to emit them.
+Transcripts are rendered with the base model's own `<|im_start|>`/`<|im_end|>` chat
+tokens (plus a fixed system header); no new vocabulary is added, which keeps every
+delimiter a well-trained token and generation stops reliable.
 
 Validation is split by whole conversation session to prevent overlapping histories
 from appearing in both splits. During training, sessions longer than the model context
@@ -94,6 +100,70 @@ contained in one window and supervised there exactly once; earlier turns may be
 repeated as masked context so later replies still see recent history.
 
 Use `prepare-sft --help` to change the session gap or validation fraction.
+
+## Retrieval personalization baseline
+
+Before training an adapter, build a training-free baseline that retrieves similar
+incoming messages and shows the base model how you replied. The pair dataset is
+derived from the existing whole-session split, so validation conversations never
+enter the retrieval index. Session SFT files remain unchanged.
+
+Install the local embedding dependencies, derive pairs, and build the private index:
+
+```bash
+uv sync --extra personalize
+uv run imessage-download prepare-pairs
+uv run --extra personalize imessage-download build-retrieval-index
+```
+
+`prepare-pairs` writes `imessage-pair-v1` files under `work/imessages/pairs/`.
+Each pair keeps the last incoming message, your reply, and the full preceding
+session context. `build-retrieval-index` embeds only training queries with
+`sentence-transformers/all-MiniLM-L6-v2`, then writes normalized vectors and
+slim pair metadata under `work/imessages/retrieval/`. Both directories contain
+private text and are ignored by Git.
+
+Induce a short style card from the training replies with one model call. Running it
+on Modal avoids loading the 4B model locally:
+
+```bash
+uv run --extra train modal run modal_train.py::style_card_main \
+  --run-name personal-qwen
+```
+
+Then compare the same held-out targets with the base prompt, retrieval demonstrations,
+and retrieval plus the style card:
+
+```bash
+uv run --extra train modal run modal_train.py::personalize_main \
+  --run-name personal-qwen
+```
+
+The comparison is saved to the `imessage-sft-artifacts` Volume at
+`/personal-qwen/personalization/sample-examples.json`. Each example includes the
+gold reply, all three generations, retrieved pair IDs and scores, and embedding
+cosine to the gold reply. That cosine uses the semantic retrieval encoder, so it
+is a content proxy rather than an authorship-verification score.
+
+After downloading the JSON, render a private browser-friendly report with:
+
+```bash
+uv run imessage-download render-personalization-report
+```
+
+The default output is
+`outputs/personal-qwen/personalization/report.html`. It presents conversation
+bubbles, your real reply, the three generated alternatives, summary scores, and
+collapsed retrieval details.
+
+For local style-card induction instead, run:
+
+```bash
+uv run --extra personalize imessage-download induce-style-card
+```
+
+Pass the resulting file to Modal sampling with
+`--style-card-path work/imessages/style-card.md`.
 
 ## Train on Modal (A100)
 

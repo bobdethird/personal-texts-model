@@ -35,22 +35,22 @@ def test_renderer_marks_every_assistant_turn_as_supervised() -> None:
 
     assert [turn["supervised"] for turn in turns] == [False, True, True]
     assert "[participant:person-a]" in turns[0]["text"]
-    assert turns[0]["text"].startswith("<|user|>")
-    assert turns[1]["text"].startswith("<|assistant|>")
-    assert turns[1]["text"].endswith("<|turn_end|>\n")
+    assert turns[0]["text"].startswith("<|im_start|>user\n")
+    assert turns[1]["text"].startswith("<|im_start|>assistant\n")
+    assert turns[1]["text"].endswith("<|im_end|>\n")
 
 
 def test_encoder_masks_user_turns_and_supervises_every_assistant_turn() -> None:
     tokenizer = CharacterTokenizer()
-    chunks = encode_sft_record(_record(), tokenizer, max_length=512)
+    chunks = encode_sft_record(_record(), tokenizer, max_length=1024)
 
     assert len(chunks) == 1
     chunk = chunks[0]
     expected_first = tokenizer.encode(
-        "<|assistant|>First reply<|turn_end|>\n", add_special_tokens=False
+        "<|im_start|>assistant\nFirst reply<|im_end|>\n", add_special_tokens=False
     )
     expected_second = tokenizer.encode(
-        "<|assistant|>Second reply<|turn_end|>\n", add_special_tokens=False
+        "<|im_start|>assistant\nSecond reply<|im_end|>\n", add_special_tokens=False
     )
     supervised = [label for label in chunk["labels"] if label != -100]
     assert supervised == expected_first + expected_second
@@ -73,7 +73,7 @@ def test_long_sessions_are_windowed_without_dropping_supervised_tokens() -> None
             {"role": "assistant", "content": "Short"},
         ],
     }
-    chunks = encode_sft_record(record, tokenizer, max_length=64)
+    chunks = encode_sft_record(record, tokenizer, max_length=256)
     expected = []
     for turn in render_session_turns(record):
         if turn["supervised"]:
@@ -84,5 +84,5 @@ def test_long_sessions_are_windowed_without_dropping_supervised_tokens() -> None
     ]
     assert len(chunks) > 1
     assert supervised == expected
-    assert all(len(chunk["input_ids"]) <= 64 for chunk in chunks)
+    assert all(len(chunk["input_ids"]) <= 256 for chunk in chunks)
     assert all(chunk["labels"][0] == -100 for chunk in chunks)

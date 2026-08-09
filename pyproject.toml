@@ -25,9 +25,15 @@ train = [
     "torch>=2.13.0",
     "transformers>=5.14.1",
 ]
+personalize = [
+    "accelerate>=1.14.0",
+    "numpy>=2.4.6",
+    "sentence-transformers>=5.7.0",
+]
 
 [dependency-groups]
 dev = [
+  "numpy>=2.4.6",
   "pytest>=8,<10",
   "ruff>=0.12,<1",
 ]

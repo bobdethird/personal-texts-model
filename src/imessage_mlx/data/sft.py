@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +8,21 @@ from imessage_mlx.data.sessions import iter_message_sessions
 from imessage_mlx.utils import read_jsonl, sha256_text, write_json, write_jsonl
 
 SFT_FORMAT = "imessage-session-v2"
+
+# Export-time placeholders (<|attachment|>, <|url|>, ...) are metadata, not
+# language. Left in, the model learns to emit them verbatim in replies.
+_PLACEHOLDER_RE = re.compile(r"<\|[a-z_]+\|>", re.IGNORECASE)
+
+# Participant pseudonyms are long hex digests; a short prefix keeps speakers
+# distinguishable without burning context tokens.
+_PARTICIPANT_PREFIX_LEN = 8
+
+
+def _clean_text(text: str) -> str:
+    cleaned = _PLACEHOLDER_RE.sub(" ", text)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r" ?\n ?", "\n", cleaned)
+    return cleaned.strip()
 
 
 def _session_id(chat_id: str, messages: list[dict[str, Any]]) -> str:
@@ -24,19 +40,24 @@ def _validation_session(session_id: str, validation_fraction: float) -> bool:
     return bucket < validation_fraction
 
 
-def _conversation_message(message: dict[str, Any]) -> dict[str, str]:
+def _conversation_message(message: dict[str, Any]) -> dict[str, str] | None:
+    """Convert an exported message; returns None when nothing textual remains."""
     sender_role = str(message["sender_role"])
-    if sender_role == "me":
-        return {"role": "assistant", "content": str(message["text"])}
-    if sender_role != "other":
+    if sender_role not in {"me", "other"}:
         raise ValueError(f"Unexpected sender_role {sender_role!r}")
 
-    result = {"role": "user", "content": str(message["text"])}
+    content = _clean_text(str(message["text"]))
+    if not content:
+        return None
+    if sender_role == "me":
+        return {"role": "assistant", "content": content}
+
+    result = {"role": "user", "content": content}
     if bool(message.get("is_group")):
         # participant_id is already pseudonymized during extraction. Keeping it as
         # metadata lets the renderer distinguish speakers without teaching the model
         # to emit participant labels in its own response.
-        result["participant"] = str(message["participant_id"])
+        result["participant"] = str(message["participant_id"])[:_PARTICIPANT_PREFIX_LEN]
     return result
 
 
@@ -65,12 +86,19 @@ def prepare_sft_dataset(
     session_count = 0
     skipped_without_outgoing = 0
     supervised_outgoing = 0
+    dropped_empty_messages = 0
 
     for chat_id, session in iter_message_sessions(
         source_messages, session_gap_minutes=session_gap_minutes
     ):
         session_count += 1
-        conversation = [_conversation_message(message) for message in session]
+        conversation = []
+        for message in session:
+            converted = _conversation_message(message)
+            if converted is None:
+                dropped_empty_messages += 1
+            else:
+                conversation.append(converted)
         assistant_indexes = [
             index for index, message in enumerate(conversation) if message["role"] == "assistant"
         ]
@@ -99,6 +127,7 @@ def prepare_sft_dataset(
         "input_messages": len(source_messages),
         "session_count": session_count,
         "skipped_sessions_without_outgoing": skipped_without_outgoing,
+        "dropped_empty_messages": dropped_empty_messages,
         "supervised_outgoing_messages": supervised_outgoing,
         "train_examples": len(train_records),
         "validation_examples": len(validation_records),

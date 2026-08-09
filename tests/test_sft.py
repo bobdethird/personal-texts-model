@@ -130,3 +130,49 @@ def test_skips_sessions_without_outgoing_and_keeps_group_speaker_metadata(
         {"role": "assistant", "content": "My answer"},
     ]
     assert records[0]["supervised_indexes"] == [2]
+
+
+def test_strips_placeholders_and_drops_empty_messages(tmp_path: Path) -> None:
+    messages = [
+        _message(
+            "with-attachment",
+            timestamp_ns=1,
+            sender_role="other",
+            text="look at this\n<|attachment|>",
+        ),
+        _message(
+            "attachment-only",
+            timestamp_ns=2,
+            sender_role="me",
+            text="<|attachment|>",
+        ),
+        _message("real-reply", timestamp_ns=3, sender_role="me", text="nice pic"),
+        _message(
+            "long-participant",
+            timestamp_ns=4,
+            sender_role="other",
+            text="who took it? <|url|> here",
+            participant_id="abcdef0123456789deadbeef",
+            is_group=True,
+        ),
+        _message("final", timestamp_ns=5, sender_role="me", text="me lol"),
+    ]
+    source = tmp_path / "messages.jsonl"
+    write_jsonl(source, messages)
+
+    report = prepare_sft_dataset(
+        source,
+        tmp_path / "train.jsonl",
+        tmp_path / "validation.jsonl",
+        tmp_path / "report.json",
+        validation_fraction=0,
+    )
+    records = list(read_jsonl(tmp_path / "train.jsonl"))
+
+    assert report["dropped_empty_messages"] == 1
+    assert len(records) == 1
+    contents = [message["content"] for message in records[0]["messages"]]
+    assert contents == ["look at this", "nice pic", "who took it? here", "me lol"]
+    assert all("<|" not in content for content in contents)
+    assert records[0]["messages"][2]["participant"] == "abcdef01"
+    assert records[0]["supervised_indexes"] == [1, 3]

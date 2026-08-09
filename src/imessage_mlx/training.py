@@ -7,37 +7,53 @@ from typing import Any
 
 from imessage_mlx.data.sft import SFT_FORMAT
 
-SPECIAL_TOKENS = (
-    "<|conversation|>",
-    "<|user|>",
-    "<|assistant|>",
-    "<|turn_end|>",
+# Reuse the base model's pretrained chat markers instead of inventing new
+# tokens. Newly added tokens would get untrained embedding/lm_head rows (LoRA
+# does not update them), which makes generation glitch at turn boundaries.
+IM_START = "<|im_start|>"
+IM_END = "<|im_end|>"
+SYSTEM_PROMPT = (
+    "Continue this text message conversation as the phone's owner, "
+    "replying in their usual texting style."
 )
 
 
 def configure_tokenizer(tokenizer: Any) -> int:
-    """Register the stable transcript delimiters and return the added-token count."""
-    added = tokenizer.add_special_tokens(
-        {"additional_special_tokens": list(SPECIAL_TOKENS)}
-    )
+    """Validate the chat markers exist and ensure a pad token. Adds no tokens."""
+    for token in (IM_START, IM_END):
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is None or token_id == getattr(tokenizer, "unk_token_id", None):
+            raise ValueError(
+                f"Tokenizer does not know {token!r}; expected a Qwen-style chat vocabulary"
+            )
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token is None:
             raise ValueError("Tokenizer must provide either a pad token or an EOS token")
         tokenizer.pad_token = tokenizer.eos_token
-    return int(added)
+    return 0
+
+
+def render_system_prefix(additional_instructions: str | None = None) -> str:
+    """Transcript header rendered once per training window and at inference."""
+    prompt = SYSTEM_PROMPT
+    if additional_instructions:
+        instructions = additional_instructions.strip()
+        if IM_START in instructions or IM_END in instructions:
+            raise ValueError("Additional system instructions may not contain chat markers")
+        prompt = f"{prompt}\n\n{instructions}"
+    return f"{IM_START}system\n{prompt}{IM_END}\n"
 
 
 def _render_turn_text(message: dict[str, Any]) -> str:
     role = message.get("role")
     if role not in {"user", "assistant"}:
         raise ValueError(f"Unsupported conversation role {role!r}")
-    marker = "<|user|>" if role == "user" else "<|assistant|>"
-    parts = [marker]
+    parts = [f"{IM_START}{role}\n"]
     participant = message.get("participant")
     if role == "user" and participant:
         parts.append(f"[participant:{participant}]\n")
     parts.append(str(message.get("content", "")))
-    parts.append("<|turn_end|>\n")
+    parts.append(f"{IM_END}\n")
     return "".join(parts)
 
 
@@ -163,10 +179,10 @@ def encode_sft_record(
     rendered = render_session_turns(record)
     tokenized = [_tokenize_turn(tokenizer, turn) for turn in rendered]
     conversation_prefix = list(
-        tokenizer.encode("<|conversation|>\n", add_special_tokens=False)
+        tokenizer.encode(render_system_prefix(), add_special_tokens=False)
     )
     if not conversation_prefix:
-        raise ValueError("Tokenizer produced an empty conversation marker")
+        raise ValueError("Tokenizer produced an empty system prefix")
 
     bos_token_id = getattr(tokenizer, "bos_token_id", None)
     prefix = ([int(bos_token_id)] if bos_token_id is not None else []) + conversation_prefix
@@ -274,8 +290,17 @@ def _tokenize_dataset(dataset: Any, tokenizer: Any, max_length: int) -> Any:
     )
 
 
-def run_training(config: dict[str, Any]) -> dict[str, Any]:
-    """Run LoRA SFT. Imports stay local so data preparation has light dependencies."""
+def run_training(
+    config: dict[str, Any],
+    *,
+    on_checkpoint_saved: Any = None,
+) -> dict[str, Any]:
+    """Run LoRA SFT. Imports stay local so data preparation has light dependencies.
+
+    ``on_checkpoint_saved`` is invoked (with no arguments) after every checkpoint
+    write so callers can flush the checkpoint to durable storage, e.g. committing
+    a Modal Volume to survive preemption.
+    """
     import torch
     from datasets import load_dataset
     from peft import LoraConfig, TaskType, get_peft_model
@@ -284,6 +309,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         AutoTokenizer,
         DataCollatorForSeq2Seq,
         Trainer,
+        TrainerCallback,
         TrainingArguments,
     )
     from transformers.trainer_utils import get_last_checkpoint
@@ -297,14 +323,15 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
 
     model_name = str(config["model_name"])
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    configure_tokenizer(tokenizer)
+    added_tokens = configure_tokenizer(tokenizer)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         dtype=torch.bfloat16,
         attn_implementation="sdpa",
     )
-    model.resize_token_embeddings(len(tokenizer))
+    if added_tokens:
+        model.resize_token_embeddings(len(tokenizer))
     model.config.use_cache = False
     model = get_peft_model(
         model,
@@ -358,12 +385,22 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         remove_unused_columns=False,
         seed=int(config["seed"]),
     )
+    callbacks = []
+    if on_checkpoint_saved is not None:
+
+        class _FlushCheckpointCallback(TrainerCallback):
+            def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+                on_checkpoint_saved()
+
+        callbacks.append(_FlushCheckpointCallback())
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=validation_dataset if has_validation else None,
         processing_class=tokenizer,
+        callbacks=callbacks or None,
         data_collator=DataCollatorForSeq2Seq(
             tokenizer=tokenizer,
             model=None,
@@ -373,7 +410,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     )
 
     resume_checkpoint = None
-    if bool(config.get("resume")):
+    if bool(config.get("resume", True)):
         resume_checkpoint = get_last_checkpoint(str(output_dir))
     train_result = trainer.train(resume_from_checkpoint=resume_checkpoint)
     model.config.use_cache = True
