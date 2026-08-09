@@ -257,6 +257,55 @@ def test_batched_neutralization_retries_only_the_invalid_records(tmp_path: Path)
     assert summary["failed"] == 0
 
 
+def test_batched_neutralization_varies_retries_and_keeps_rejected_drafts(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "pairs.jsonl"
+    attempts: list[int] = []
+
+    def batch_generator(
+        prompts: list[list[dict[str, str]]],
+        *,
+        attempt: int,
+    ) -> list[str]:
+        attempts.append(attempt)
+        if attempt == 0:
+            return ['{"neutral_bubbles":["cant come at 7"]}'] * len(prompts)
+        return ['{"neutral_bubbles":["I cannot come at 7."]}'] * len(prompts)
+
+    source = [{"pair_id": "p0", "reply": "cant come at 7", "split": "train"}]
+    summary = run_neutralization(
+        source,
+        output,
+        batch_generator=batch_generator,
+        batch_size=1,
+    )
+
+    assert attempts == [0, 1]
+    assert summary["generated"] == 1
+    assert summary["failed"] == 0
+
+
+def test_failures_record_the_rejected_draft(tmp_path: Path) -> None:
+    output = tmp_path / "pairs.jsonl"
+
+    def batch_generator(prompts: list[list[dict[str, str]]]) -> list[str]:
+        return ['{"neutral_bubbles":["cant come at 7"]}'] * len(prompts)
+
+    summary = run_neutralization(
+        [{"pair_id": "p0", "reply": "cant come at 7", "split": "train"}],
+        output,
+        batch_generator=batch_generator,
+        batch_size=1,
+        max_attempts=1,
+    )
+
+    failure = summary["failures"][0]
+    assert failure["errors"] == ["unchanged_text"]
+    assert failure["original"] == ["cant come at 7"]
+    assert failure["rejected"] == ["cant come at 7"]
+
+
 def test_batched_neutralization_records_persistently_invalid_records(tmp_path: Path) -> None:
     output = tmp_path / "pairs.jsonl"
 

@@ -762,25 +762,29 @@ def _make_qwen_neutralizer(
         torch.cuda.manual_seed_all(int(config["seed"]))
 
     temperature = float(config.get("neutralize_temperature", 0.2))
+    retry_temperature = float(config.get("neutralize_retry_temperature", 0.9))
     max_new_tokens = int(config.get("neutralize_max_new_tokens", 512))
+    top_p = float(config.get("neutralize_top_p", 0.9))
 
-    generation_options: dict[str, Any] = {
-        "max_new_tokens": max_new_tokens,
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
-    }
-    if temperature > 0:
-        generation_options.update(
-            {
-                "do_sample": True,
-                "temperature": temperature,
-                "top_p": float(config.get("neutralize_top_p", 0.9)),
-            }
-        )
-    else:
-        generation_options["do_sample"] = False
+    def options_for(attempt: int) -> dict[str, Any]:
+        # The first pass stays near-deterministic for faithfulness. Retries must
+        # sample more widely, since repeating a rejected draft wastes the attempt.
+        chosen = temperature if attempt == 0 else max(temperature, retry_temperature)
+        options: dict[str, Any] = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+        }
+        if chosen > 0:
+            options.update({"do_sample": True, "temperature": chosen, "top_p": top_p})
+        else:
+            options["do_sample"] = False
+        return options
 
-    def generate_once(batch: list[list[dict[str, str]]]) -> list[str]:
+    def generate_once(
+        batch: list[list[dict[str, str]]],
+        generation_options: dict[str, Any],
+    ) -> list[str]:
         prompts = [
             tokenizer.apply_chat_template(
                 messages,
@@ -798,20 +802,20 @@ def _make_qwen_neutralizer(
             skip_special_tokens=True,
         )
 
-    def generate_batch(batch: list[list[dict[str, str]]]) -> list[str]:
+    def generate_batch(batch: list[list[dict[str, str]]], *, attempt: int = 0) -> list[str]:
         # Prompt lengths vary enough that a whole batch occasionally exceeds GPU
         # memory. Halving the batch recovers without failing the stage.
         try:
-            return generate_once(batch)
+            return generate_once(batch, options_for(attempt))
         except torch.OutOfMemoryError:
             if len(batch) == 1:
                 raise
             torch.cuda.empty_cache()
             print(f"neutralize: splitting batch of {len(batch)} after OOM", flush=True)
         middle = len(batch) // 2
-        first = generate_batch(batch[:middle])
+        first = generate_batch(batch[:middle], attempt=attempt)
         torch.cuda.empty_cache()
-        return first + generate_batch(batch[middle:])
+        return first + generate_batch(batch[middle:], attempt=attempt)
 
     return generate_batch
 

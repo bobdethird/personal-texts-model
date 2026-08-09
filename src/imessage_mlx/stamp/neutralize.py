@@ -7,6 +7,7 @@ locally, remotely, or in tests without importing an inference framework.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from collections import Counter
@@ -429,6 +430,18 @@ class _PendingUnit:
     context: list[str]
     messages: list[dict[str, str]]
     errors: list[str]
+    rejected: list[str]
+
+
+def _accepts_attempt(function: Callable[..., Any]) -> bool:
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+    return "attempt" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 def _chunked(items: Iterable[Any], size: int) -> Iterable[list[Any]]:
@@ -482,9 +495,16 @@ def run_neutralization(
             raise ValueError("Existing neutral pairs must have unique nonempty pair IDs")
         completed.add(pair_id)
 
-    def generate_many(prompts: list[list[dict[str, str]]]) -> list[Any]:
+    batch_takes_attempt = batch_generator is not None and _accepts_attempt(batch_generator)
+
+    def generate_many(prompts: list[list[dict[str, str]]], attempt: int) -> list[Any]:
         if batch_generator is not None:
-            outputs = list(batch_generator(prompts))
+            # A retry must sample differently, or it reproduces the rejected draft.
+            outputs = list(
+                batch_generator(prompts, attempt=attempt)
+                if batch_takes_attempt
+                else batch_generator(prompts)
+            )
             if len(outputs) != len(prompts):
                 raise ValueError("batch_generator returned the wrong number of outputs")
             return outputs
@@ -517,16 +537,17 @@ def run_neutralization(
                     config=prompt_config,
                 ),
                 errors=[],
+                rejected=[],
             )
 
     for chunk in _chunked(pending_units(), batch_size):
         remaining = list(chunk)
         chunk_pairs: list[dict[str, Any]] = []
-        for _attempt in range(max_attempts):
+        for attempt in range(max_attempts):
             if not remaining:
                 break
             try:
-                outputs = generate_many([unit.messages for unit in remaining])
+                outputs = generate_many([unit.messages for unit in remaining], attempt)
             except (TypeError, ValueError, json.JSONDecodeError) as error:
                 for unit in remaining:
                     unit.errors.append(str(error))
@@ -547,6 +568,9 @@ def run_neutralization(
                     continue
                 if not validation.valid:
                     unit.errors.extend(validation.errors)
+                    # Keeping the rejected draft makes it possible to tell a
+                    # prompt-adherence failure from an unusable input.
+                    unit.rejected.append(" / ".join(neutral))
                     retry.append(unit)
                     continue
                 chunk_pairs.append(
@@ -567,6 +591,8 @@ def run_neutralization(
             {
                 "pair_id": unit.pair_id,
                 "errors": list(dict.fromkeys(unit.errors)) or ["generation_failed"],
+                "original": list(unit.original),
+                "rejected": list(unit.rejected),
             }
             for unit in remaining
         )
