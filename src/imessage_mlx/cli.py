@@ -227,6 +227,21 @@ def prepare_stamp(
         int,
         typer.Option(min=1, help="Candidate chains per structured judge call"),
     ] = 32,
+    judge_concurrency: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            help="Parallel OpenAI judge requests (stay under gpt-5.6-luna RPM/TPM)",
+        ),
+    ] = 64,
+    judge_timeout: Annotated[
+        float,
+        typer.Option(min=1.0, help="Per-request judge timeout in seconds"),
+    ] = 120.0,
+    judge_max_retries: Annotated[
+        int,
+        typer.Option(min=0, help="Judge retries for timeouts and rate limits"),
+    ] = 6,
     heldout_test_fraction: Annotated[
         float,
         typer.Option(min=0.0, max=1.0, help="Held-out sessions reserved for final test"),
@@ -255,6 +270,10 @@ def prepare_stamp(
         heldout_test_fraction=heldout_test_fraction,
         min_chars=min_chars,
         judge_batch_size=judge_batch_size,
+        judge_concurrency=judge_concurrency,
+        judge_timeout=judge_timeout,
+        judge_max_retries=judge_max_retries,
+        show_progress=True,
     )
     _emit(result)
 

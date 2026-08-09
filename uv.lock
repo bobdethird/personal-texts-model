@@ -775,6 +775,7 @@ stamp = [
     { name = "scikit-learn" },
     { name = "sentence-transformers" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "transformers" },
     { name = "trl" },
 ]
@@ -816,6 +817,7 @@ requires-dist = [
     { name = "sentence-transformers", marker = "extra == 'stamp'", specifier = ">=5.7.0" },
     { name = "torch", marker = "extra == 'stamp'", specifier = ">=2.13.0" },
     { name = "torch", marker = "extra == 'train'", specifier = ">=2.13.0" },
+    { name = "tqdm", marker = "extra == 'stamp'", specifier = ">=4.67.3" },
     { name = "transformers", marker = "extra == 'stamp'", specifier = ">=5.14.1" },
     { name = "transformers", marker = "extra == 'train'", specifier = ">=5.14.1" },
     { name = "trl", marker = "extra == 'stamp'", specifier = ">=1.9.2" },

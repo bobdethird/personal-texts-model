@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -113,9 +115,11 @@ class FakeJudge:
     ) -> None:
         self.rules = rules
         self.calls = 0
+        self._lock = threading.Lock()
 
     def judge(self, candidates: list[CandidateChain]) -> list[ChainDecision]:
-        self.calls += 1
+        with self._lock:
+            self.calls += 1
         return [
             ChainDecision(
                 candidate_id=candidate.candidate_id,
@@ -127,11 +131,66 @@ class FakeJudge:
         ]
 
 
+class ConcurrentFakeJudge:
+    cache_key = "tests.concurrent-fake-judge-v1"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
+        self._lock = threading.Lock()
+
+    def judge(self, candidates: list[CandidateChain]) -> list[ChainDecision]:
+        with self._lock:
+            self.calls += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(0.05)
+            return [
+                ChainDecision(
+                    candidate_id=candidate.candidate_id,
+                    boundaries=tuple(
+                        BoundaryDecision(True, "same utterance")
+                        for _ in range(len(candidate.bubbles) - 1)
+                    ),
+                )
+                for candidate in candidates
+            ]
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
 class FailingJudge:
     cache_key = "tests.failing-judge-v1"
 
     def judge(self, candidates: list[CandidateChain]) -> object:
         raise RuntimeError(f"unavailable for {len(candidates)} candidates")
+
+
+class FlakyJudge:
+    """Fails on the first run, then succeeds while keeping one cache key."""
+
+    cache_key = "tests.flaky-judge-v1"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def judge(self, candidates: list[CandidateChain]) -> list[ChainDecision]:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("judge unavailable")
+        return [
+            ChainDecision(
+                candidate_id=candidate.candidate_id,
+                boundaries=tuple(
+                    BoundaryDecision(True, "same utterance")
+                    for _ in range(len(candidate.bubbles) - 1)
+                ),
+            )
+            for candidate in candidates
+        ]
 
 
 def test_candidate_prefilter_requires_adjacent_close_outgoing_messages() -> None:
@@ -371,6 +430,217 @@ def test_report_and_resume_artifact_are_private_and_text_free(tmp_path: Path) ->
     assert secret_b not in report_text
     assert secret_a not in artifact_text
     assert secret_b not in artifact_text
+
+
+def test_judge_concurrency_runs_pending_batches_in_parallel(tmp_path: Path) -> None:
+    messages: list[dict[str, object]] = []
+    for index in range(8):
+        base = index * 10 * MINUTE_NS
+        messages.extend(
+            [
+                _message(
+                    f"a{index}",
+                    timestamp_ns=base,
+                    text=f"left-{index}",
+                    chat_id=f"chat-{index}",
+                ),
+                _message(
+                    f"b{index}",
+                    timestamp_ns=base + MINUTE_NS,
+                    text=f"right-{index}",
+                    chat_id=f"chat-{index}",
+                ),
+            ]
+        )
+    judge = ConcurrentFakeJudge()
+    report, _ = _prepare(
+        tmp_path,
+        messages,
+        judge=judge,
+        judge_batch_size=1,
+        judge_concurrency=4,
+    )
+
+    assert report["judge_batches"] == 8
+    assert judge.calls == 8
+    assert judge.max_active >= 2
+
+
+def test_one_bad_candidate_does_not_fail_its_whole_batch_closed(tmp_path: Path) -> None:
+    messages: list[dict[str, object]] = []
+    for index in range(4):
+        base = index * 10 * MINUTE_NS
+        messages.extend(
+            [
+                _message(
+                    f"a{index}",
+                    timestamp_ns=base,
+                    text=f"left-{index}",
+                    chat_id=f"chat-{index}",
+                ),
+                _message(
+                    f"b{index}",
+                    timestamp_ns=base + MINUTE_NS,
+                    text=f"right-{index}",
+                    chat_id=f"chat-{index}",
+                ),
+            ]
+        )
+
+    class DropsOneCandidateJudge:
+        """Omits one candidate whenever it is asked about more than one."""
+
+        cache_key = "tests.drops-one-candidate-v1"
+
+        def __init__(self, poison: str) -> None:
+            self.poison = poison
+
+        def judge(self, candidates: list[CandidateChain]) -> list[ChainDecision]:
+            kept = [
+                candidate
+                for candidate in candidates
+                if not (
+                    len(candidates) > 1
+                    and candidate.bubbles[0].text == self.poison
+                )
+            ]
+            return [
+                ChainDecision(
+                    candidate_id=candidate.candidate_id,
+                    boundaries=(BoundaryDecision(True, "same utterance"),),
+                )
+                for candidate in kept
+            ]
+
+    report, paths = _prepare(
+        tmp_path,
+        messages,
+        judge=DropsOneCandidateJudge("left-2"),
+        judge_batch_size=4,
+    )
+
+    # Splitting isolates the poisoned candidate, which the judge answers alone.
+    assert report["failed_batches"] == 0
+    assert report["closed_candidates"] == 0
+    assert report["merged_boundaries"] == 4
+    assert list(read_jsonl(paths["artifact"]))[0]["status"] == "completed"
+
+
+def test_unsplittable_candidate_fails_closed_without_its_neighbors(tmp_path: Path) -> None:
+    messages: list[dict[str, object]] = []
+    for index in range(4):
+        base = index * 10 * MINUTE_NS
+        messages.extend(
+            [
+                _message(
+                    f"a{index}",
+                    timestamp_ns=base,
+                    text=f"left-{index}",
+                    chat_id=f"chat-{index}",
+                ),
+                _message(
+                    f"b{index}",
+                    timestamp_ns=base + MINUTE_NS,
+                    text=f"right-{index}",
+                    chat_id=f"chat-{index}",
+                ),
+            ]
+        )
+
+    class AlwaysBadForOneJudge:
+        cache_key = "tests.always-bad-for-one-v1"
+
+        def __init__(self, poison: str) -> None:
+            self.poison = poison
+
+        def judge(self, candidates: list[CandidateChain]) -> list[ChainDecision]:
+            if any(candidate.bubbles[0].text == self.poison for candidate in candidates):
+                raise RuntimeError("judge cannot answer this candidate")
+            return [
+                ChainDecision(
+                    candidate_id=candidate.candidate_id,
+                    boundaries=(BoundaryDecision(True, "same utterance"),),
+                )
+                for candidate in candidates
+            ]
+
+    report, _ = _prepare(
+        tmp_path,
+        messages,
+        judge=AlwaysBadForOneJudge("left-2"),
+        judge_batch_size=4,
+    )
+
+    assert report["failed_batches"] == 1
+    assert report["closed_candidates"] == 1
+    assert report["merged_boundaries"] == 3
+
+
+def test_retried_batch_replaces_its_failed_artifact_record(tmp_path: Path) -> None:
+    messages = [
+        _message("a", timestamp_ns=0, text="one"),
+        _message("b", timestamp_ns=MINUTE_NS, text="two"),
+    ]
+    judge = FlakyJudge()
+
+    failed_report, paths = _prepare(
+        tmp_path,
+        messages,
+        judge=judge,
+        judge_batch_size=1,
+    )
+    recovered_report, _ = _prepare(
+        tmp_path,
+        messages,
+        judge=judge,
+        judge_batch_size=1,
+    )
+
+    assert failed_report["failed_batches"] == 1
+    assert recovered_report["failed_batches"] == 0
+    assert recovered_report["resumed_batches"] == 0
+    artifacts = list(read_jsonl(paths["artifact"]))
+    assert len(artifacts) == 1
+    assert artifacts[0]["status"] == "completed"
+
+
+def test_openai_judge_passes_timeout_and_retry_budget() -> None:
+    candidate = CandidateChain(
+        candidate_id="candidate",
+        session_id="session",
+        bubbles=(Bubble("a", 0, "one"), Bubble("b", MINUTE_NS, "two")),
+    )
+
+    class Responses:
+        def __init__(self) -> None:
+            self.request: dict[str, object] = {}
+
+        def create(self, **kwargs: object) -> SimpleNamespace:
+            self.request = kwargs
+            return SimpleNamespace(
+                output_text=json.dumps(
+                    {
+                        "decisions": [
+                            {
+                                "candidate_id": "candidate",
+                                "boundaries": [{"merge": False, "reason": "separate"}],
+                            }
+                        ]
+                    }
+                )
+            )
+
+    responses = Responses()
+    judge = OpenAIModelJudge(
+        client=SimpleNamespace(responses=responses),
+        timeout=12.5,
+        max_retries=3,
+    )
+
+    judge.judge([candidate])
+
+    assert responses.request["timeout"] == 12.5
+    assert judge.max_retries == 3
 
 
 def test_openai_judge_uses_configurable_strict_structured_output() -> None:

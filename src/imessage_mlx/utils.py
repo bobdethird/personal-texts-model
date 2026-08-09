@@ -78,6 +78,20 @@ def write_jsonl(path: str | Path, records: Iterable[dict[str, Any]]) -> int:
     return count
 
 
+def append_jsonl(path: str | Path, record: dict[str, Any]) -> Path:
+    """Append one record, creating the file with private permissions if needed."""
+
+    destination = Path(path)
+    ensure_private_dir(destination.parent)
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    destination.chmod(0o600)
+    return destination
+
+
 def read_jsonl(path: str | Path) -> Iterator[dict[str, Any]]:
     with Path(path).open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
