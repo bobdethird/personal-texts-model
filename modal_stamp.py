@@ -2007,6 +2007,8 @@ def _round_config(
     base_config: Mapping[str, Any],
     round_number: int,
     previous_state_path: str,
+    *,
+    preference_limit: int | None = None,
 ) -> dict[str, Any]:
     round_name = _round_name(round_number)
     round_dir = f"{base_config['stamp_output_dir']}/rounds/{round_name}"
@@ -2036,6 +2038,10 @@ def _round_config(
             "output_dir": cpo_dir,
         }
     )
+    # Round-local so the earlier stages keep the fingerprints they completed
+    # under; putting this in the base config would re-run neutralize and SFT.
+    if preference_limit is not None:
+        config["preference_limit"] = preference_limit
     return config
 
 
@@ -2111,6 +2117,7 @@ def _execute_stamp_command(
     config: dict[str, Any],
     prepare_config: dict[str, Any] | None = None,
     round_number: int = 1,
+    preference_limit: int | None = None,
     call_stage: Callable[[Any, dict[str, Any]], dict[str, Any]] = _call_stage,
 ) -> dict[str, Any]:
     """Run one STAMP command after inputs are already on Modal volumes.
@@ -2156,7 +2163,12 @@ def _execute_stamp_command(
                 f"round_number {round_number} exceeds configured rounds {config['rounds']}"
             )
         previous_state = _default_state_path(config, round_number)
-        round_config = _round_config(config, round_number, previous_state)
+        round_config = _round_config(
+            config,
+            round_number,
+            previous_state,
+            preference_limit=preference_limit,
+        )
         if command == "preferences":
             results["preferences"] = call_stage(
                 generate_and_score_preferences,
@@ -2169,7 +2181,12 @@ def _execute_stamp_command(
     round_states: list[str] = []
     if command == "run":
         for current_round in range(1, int(config["rounds"]) + 1):
-            round_config = _round_config(config, current_round, current_state)
+            round_config = _round_config(
+                config,
+                current_round,
+                current_state,
+                preference_limit=preference_limit,
+            )
             results[f"preferences-{_round_name(current_round)}"] = call_stage(
                 generate_and_score_preferences,
                 round_config,
@@ -2220,6 +2237,7 @@ def orchestrate_stamp(
     config: dict[str, Any],
     prepare_config: dict[str, Any] | None = None,
     round_number: int = 1,
+    preference_limit: int | None = None,
 ) -> dict[str, Any]:
     """Run the STAMP stage graph entirely on Modal so detach survives sleep."""
 
@@ -2228,6 +2246,7 @@ def orchestrate_stamp(
         config=config,
         prepare_config=prepare_config,
         round_number=round_number,
+        preference_limit=preference_limit,
         call_stage=_call_stage,
     )
 
@@ -2257,6 +2276,7 @@ def main(
     round_number: int = 1,
     seed: int = DEFAULT_SEED,
     limit: int = 0,
+    preference_limit: int = 0,
     smoke: bool = False,
     resume: bool = True,
     force: bool = False,
@@ -2268,6 +2288,10 @@ def main(
 
     Uploads happen locally; stage chaining runs in ``orchestrate_stamp`` so
     ``modal run --detach`` can finish SFT/CPO/eval after the laptop sleeps.
+
+    ``preference_limit`` caps the pairs each CPO round samples candidates for.
+    Unlike ``limit`` it stays inside the round config, so stages that already
+    finished keep their fingerprints and are still skipped.
     """
     normalized_command = command.lower().replace("_", "-")
     aliases = {
@@ -2347,6 +2371,7 @@ def main(
         config,
         prepare_config,
         round_number,
+        preference_limit or None,
     )
     print(f"Spawned orchestrate_stamp FunctionCall: {call.object_id}")
     print(
