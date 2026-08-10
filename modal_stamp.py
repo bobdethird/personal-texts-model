@@ -744,6 +744,8 @@ def _make_qwen_neutralizer(
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    from imessage_mlx.stamp.neutralize import token_budget_slices
+
     model_name = str(config["model_name"])
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     if tokenizer.pad_token_id is None:
@@ -765,6 +767,7 @@ def _make_qwen_neutralizer(
     retry_temperature = float(config.get("neutralize_retry_temperature", 0.9))
     max_new_tokens = int(config.get("neutralize_max_new_tokens", 512))
     top_p = float(config.get("neutralize_top_p", 0.9))
+    token_budget = int(config.get("neutralize_token_budget", 16384))
 
     def options_for(attempt: int) -> dict[str, Any]:
         # The first pass stays near-deterministic for faithfulness. Retries must
@@ -781,18 +784,7 @@ def _make_qwen_neutralizer(
             options["do_sample"] = False
         return options
 
-    def generate_once(
-        batch: list[list[dict[str, str]]],
-        generation_options: dict[str, Any],
-    ) -> list[str]:
-        prompts = [
-            tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            for messages in batch
-        ]
+    def generate_once(prompts: list[str], generation_options: dict[str, Any]) -> list[str]:
         inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
         with torch.inference_mode():
             generated = model.generate(**inputs, **generation_options)
@@ -802,20 +794,42 @@ def _make_qwen_neutralizer(
             skip_special_tokens=True,
         )
 
-    def generate_batch(batch: list[list[dict[str, str]]], *, attempt: int = 0) -> list[str]:
-        # Prompt lengths vary enough that a whole batch occasionally exceeds GPU
-        # memory. Halving the batch recovers without failing the stage.
+    def generate_slice(prompts: list[str], attempt: int) -> list[str]:
+        failed_size = 0
         try:
-            return generate_once(batch, options_for(attempt))
+            return generate_once(prompts, options_for(attempt))
         except torch.OutOfMemoryError:
-            if len(batch) == 1:
+            if len(prompts) == 1:
                 raise
-            torch.cuda.empty_cache()
-            print(f"neutralize: splitting batch of {len(batch)} after OOM", flush=True)
-        middle = len(batch) // 2
-        first = generate_batch(batch[:middle], attempt=attempt)
+            failed_size = len(prompts)
+        # Freeing has to happen after the except block: while it is running, the
+        # exception's traceback still references the failed frame and its tensors,
+        # so empty_cache() would have nothing it is allowed to release.
         torch.cuda.empty_cache()
-        return first + generate_batch(batch[middle:], attempt=attempt)
+        print(f"neutralize: splitting batch of {failed_size} after OOM", flush=True)
+        middle = failed_size // 2
+        first = generate_slice(prompts[:middle], attempt)
+        torch.cuda.empty_cache()
+        return first + generate_slice(prompts[middle:], attempt)
+
+    def generate_batch(batch: list[list[dict[str, str]]], *, attempt: int = 0) -> list[str]:
+        prompts = [
+            tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for messages in batch
+        ]
+        # Padding makes every sequence as long as the longest in its batch, so a
+        # single long message would otherwise size the whole batch's KV cache.
+        # Grouping by a token budget keeps peak memory flat instead of relying on
+        # recovery after the allocator has already run out.
+        lengths = [len(ids) + max_new_tokens for ids in tokenizer(prompts)["input_ids"]]
+        outputs: list[str] = []
+        for start, end in token_budget_slices(lengths, token_budget):
+            outputs.extend(generate_slice(prompts[start:end], attempt))
+        return outputs
 
     return generate_batch
 

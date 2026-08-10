@@ -21,6 +21,7 @@ from imessage_mlx.stamp.neutralize import (
     normalized_numbers,
     parse_neutral_output,
     run_neutralization,
+    token_budget_slices,
     validate_neutral,
 )
 from imessage_mlx.stamp.preference import (
@@ -306,6 +307,25 @@ def test_failures_record_the_rejected_draft(tmp_path: Path) -> None:
     assert "numbers_changed" in failure["errors"]
     assert failure["original"] == ["cant come at 7"]
     assert failure["rejected"] == ["I cannot come at 7 and 8."]
+
+
+def test_token_budget_slices_bound_the_padded_batch_cost() -> None:
+    # Uniform short prompts pack together, since 4 * 100 stays under budget.
+    assert token_budget_slices([100] * 4, 1000) == [(0, 4)]
+
+    # One long prompt pads everything beside it, so it must batch alone.
+    spans = token_budget_slices([100, 900, 100, 100], 1000)
+    assert spans == [(0, 1), (1, 2), (2, 4)]
+    for start, end in spans:
+        lengths = [100, 900, 100, 100][start:end]
+        assert max(lengths) * len(lengths) <= 1000
+
+    # A single prompt over budget still has to run, rather than looping forever.
+    assert token_budget_slices([5000], 1000) == [(0, 1)]
+    assert token_budget_slices([], 1000) == []
+
+    with pytest.raises(ValueError):
+        token_budget_slices([10], 0)
 
 
 def test_unchanged_pairs_are_kept_but_capped(tmp_path: Path) -> None:

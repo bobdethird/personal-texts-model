@@ -436,6 +436,33 @@ class _PendingUnit:
     rejected: list[str]
 
 
+def token_budget_slices(lengths: Sequence[int], budget: int) -> list[tuple[int, int]]:
+    """Group consecutive items into ``[start, end)`` spans that fit a token budget.
+
+    Padding makes every sequence in a batch as long as the longest one, so the
+    cost of a span is ``len(span) * max(span)`` rather than its sum. Order is
+    preserved so callers can zip results back onto their inputs.
+    """
+
+    if budget < 1:
+        raise ValueError("budget must be positive")
+    spans: list[tuple[int, int]] = []
+    start = 0
+    total = len(lengths)
+    while start < total:
+        longest = 0
+        end = start
+        while end < total:
+            candidate = max(longest, lengths[end])
+            if end > start and candidate * (end - start + 1) > budget:
+                break
+            longest = candidate
+            end += 1
+        spans.append((start, end))
+        start = end
+    return spans
+
+
 def _unchanged_has_room(unchanged: int, accepted: int, ratio: float) -> bool:
     """Report whether one more unchanged pair stays within the allowed share."""
 
