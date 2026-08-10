@@ -872,6 +872,35 @@ def _make_neutralize_reporter(
     return report
 
 
+def _make_progress_logger(
+    label: str,
+    total: int,
+    *,
+    every: int = 25,
+) -> Callable[..., None]:
+    """Log throughput and ETA for a loop that generates one record at a time.
+
+    These loops run for hours and are otherwise silent, which leaves no way to
+    tell slow progress apart from a hang.
+    """
+
+    started = time.monotonic()
+
+    def report(done: int, **extra: Any) -> None:
+        if done % every and done < total:
+            return
+        elapsed = max(time.monotonic() - started, 1e-6)
+        rate = done / elapsed
+        remaining = f"{(total - done) / rate / 60:.1f} min" if rate > 0 else "unknown"
+        details = "".join(f" {key}={value}" for key, value in extra.items())
+        print(
+            f"{label}: {done}/{total} ({rate:.2f}/s, ~{remaining} left{details})",
+            flush=True,
+        )
+
+    return report
+
+
 def _run_neutralization_core(config: dict[str, Any]) -> Any:
     function = _resolve_callable(_NEUTRALIZE_MODULES, _NEUTRALIZE_CALLABLES)
     if function is None:  # pragma: no cover - required=True guarantees this.
@@ -1304,6 +1333,13 @@ def _generate_and_score_locally(config: dict[str, Any]) -> dict[str, Any]:
     scorers = _load_reward_scorers(config)
     candidate_groups: list[dict[str, Any]] = []
     skipped_pairs: list[dict[str, str]] = []
+    round_label = _round_name(int(config["round"]))
+    print(
+        f"preferences[{round_label}]: sampling {config['candidates_per_input']} "
+        f"candidates for {len(records)} pairs",
+        flush=True,
+    )
+    progress = _make_progress_logger(f"preferences[{round_label}]", len(records))
     for index, record in enumerate(records):
         pair_id = str(record.get("pair_id", ""))
         neutral_value = record.get("neutral")
@@ -1336,23 +1372,24 @@ def _generate_and_score_locally(config: dict[str, Any]) -> dict[str, Any]:
             # A pair the model cannot rewrite twice yields no preference, but it
             # says nothing about the rest of the corpus, so drop it and continue.
             skipped_pairs.append({"pair_id": pair_id, "reason": str(error)})
-            continue
-        texts = ["\n".join(candidate) for candidate in bubbles]
-        rewards = _score_rewrites(
-            pair_id=pair_id,
-            source_text="\n".join(neutral_bubbles),
-            candidate_texts=texts,
-            scorers=scorers,
-            config=config,
-        )
-        candidate_groups.append(
-            {
-                "pair_id": pair_id,
-                "neutral": neutral_bubbles,
-                "bubbles": bubbles,
-                "rewards": rewards,
-            }
-        )
+        else:
+            texts = ["\n".join(candidate) for candidate in bubbles]
+            rewards = _score_rewrites(
+                pair_id=pair_id,
+                source_text="\n".join(neutral_bubbles),
+                candidate_texts=texts,
+                scorers=scorers,
+                config=config,
+            )
+            candidate_groups.append(
+                {
+                    "pair_id": pair_id,
+                    "neutral": neutral_bubbles,
+                    "bubbles": bubbles,
+                    "rewards": rewards,
+                }
+            )
+        progress(index + 1, kept=len(candidate_groups), skipped=len(skipped_pairs))
 
     if skipped_pairs:
         print(
@@ -1740,6 +1777,8 @@ def evaluate(config: dict[str, Any]) -> dict[str, Any]:
                 str(state_path),
             )
             rows: list[dict[str, Any]] = []
+            print(f"evaluate[{name}]: rewriting {len(records)} test pairs", flush=True)
+            progress = _make_progress_logger(f"evaluate[{name}]", len(records))
             for record_index, record in enumerate(records):
                 pair_id = str(record.get("pair_id", ""))
                 neutral_value = record.get("neutral")
@@ -1786,6 +1825,7 @@ def evaluate(config: dict[str, Any]) -> dict[str, Any]:
                         **reward.as_dict(),
                     }
                 )
+                progress(record_index + 1)
             named_rows[str(name)] = rows
             safe_name = _safe_run_name(str(name))
             _write_jsonl(
