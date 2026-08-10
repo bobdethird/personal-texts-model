@@ -9,7 +9,12 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
-from imessage_mlx.stamp.neutralize import NEUTRAL_PAIR_FORMAT
+from imessage_mlx.stamp.neutralize import (
+    NEUTRAL_PAIR_FORMAT,
+    NeutralValidationConfig,
+    NeutralValidationResult,
+    validate_neutral,
+)
 from imessage_mlx.utils import (
     ensure_private_dir,
     ensure_private_file,
@@ -22,6 +27,18 @@ Rewrite a neutral text-message draft in the phone owner's characteristic style.
 Preserve meaning, facts, numbers, names, placeholders, and negation. Do not reply
 to the message. Decide naturally whether the owner would send one bubble or a
 short multi-bubble burst."""
+
+# Style transfer runs the opposite way from neutralization, so the neutral-side
+# invariants do not all hold. Texting style drops pronouns ("I'll send the name"
+# -> "Wait send name") and freely inflates or deflates very short messages
+# ("yes" -> "YES LMAO"), both of which a real sender does constantly. Measured
+# against the ground-truth originals, the neutralization defaults reject 10.5%
+# of perfect rewrites while these bounds reject none.
+REWRITE_VALIDATION = NeutralValidationConfig(
+    require_person_preserved=False,
+    min_length_ratio=0.2,
+    max_length_ratio=4.0,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +180,21 @@ def parse_rewrite_output(
     if any(not bubble.strip() for bubble in bubbles):
         raise ValueError("Rewrite output contains an empty bubble")
     return bubbles
+
+
+def validate_rewrite(
+    neutral_bubbles: str | Sequence[str],
+    styled_bubbles: str | Sequence[str],
+    *,
+    config: NeutralValidationConfig | None = None,
+) -> NeutralValidationResult:
+    """Check that a styled rewrite kept the content of its neutral draft."""
+
+    return validate_neutral(
+        neutral_bubbles,
+        styled_bubbles,
+        config=config or REWRITE_VALIDATION,
+    )
 
 
 def build_sft_example(

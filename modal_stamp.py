@@ -73,6 +73,15 @@ _GPU_FUNCTION_OPTIONS: dict[str, Any] = {
     "single_use_containers": True,
     "volumes": _VOLUMES,
 }
+# CPU coordinator so `modal run --detach` can finish later stages after the
+# laptop disconnects. Stage work still runs on the GPU functions below.
+_ORCHESTRATOR_FUNCTION_OPTIONS: dict[str, Any] = {
+    "image": stamp_image,
+    "cpu": 2,
+    "memory": 4_096,
+    "timeout": 24 * 60 * 60,
+    "retries": 0,
+}
 
 _PREPARE_MODULES = ("imessage_mlx.data.stamp",)
 _PREPARE_CALLABLES = (
@@ -1075,8 +1084,11 @@ def _generate_rewrite_candidates(
 ) -> list[list[str]]:
     import torch
 
-    from imessage_mlx.stamp.neutralize import validate_neutral
-    from imessage_mlx.stamp.sft import build_rewrite_messages, parse_rewrite_output
+    from imessage_mlx.stamp.sft import (
+        build_rewrite_messages,
+        parse_rewrite_output,
+        validate_rewrite,
+    )
 
     messages = build_rewrite_messages(neutral_bubbles)
     prompt = tokenizer.apply_chat_template(
@@ -1119,7 +1131,7 @@ def _generate_rewrite_candidates(
                 )
             except (TypeError, ValueError):
                 continue
-            validation = validate_neutral(neutral_bubbles, bubbles)
+            validation = validate_rewrite(neutral_bubbles, bubbles)
             key = json.dumps(bubbles, ensure_ascii=False, separators=(",", ":"))
             if validation.valid and key not in seen:
                 seen.add(key)
@@ -1128,7 +1140,7 @@ def _generate_rewrite_candidates(
                     return candidates
     for fallback in fallback_bubbles:
         normalized = [str(bubble) for bubble in fallback]
-        validation = validate_neutral(neutral_bubbles, normalized)
+        validation = validate_rewrite(neutral_bubbles, normalized)
         key = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
         if validation.valid and key not in seen:
             seen.add(key)
@@ -1291,6 +1303,7 @@ def _generate_and_score_locally(config: dict[str, Any]) -> dict[str, Any]:
     )
     scorers = _load_reward_scorers(config)
     candidate_groups: list[dict[str, Any]] = []
+    skipped_pairs: list[dict[str, str]] = []
     for index, record in enumerate(records):
         pair_id = str(record.get("pair_id", ""))
         neutral_value = record.get("neutral")
@@ -1309,15 +1322,21 @@ def _generate_and_score_locally(config: dict[str, Any]) -> dict[str, Any]:
             hashlib.sha256(pair_id.encode()).hexdigest()[:8],
             16,
         )
-        bubbles = _generate_rewrite_candidates(
-            model=generation_model,
-            tokenizer=generation_tokenizer,
-            neutral_bubbles=neutral_bubbles,
-            count=int(config["candidates_per_input"]),
-            seed=record_seed + index,
-            config=config,
-            fallback_bubbles=(neutral_bubbles, original_bubbles),
-        )
+        try:
+            bubbles = _generate_rewrite_candidates(
+                model=generation_model,
+                tokenizer=generation_tokenizer,
+                neutral_bubbles=neutral_bubbles,
+                count=int(config["candidates_per_input"]),
+                seed=record_seed + index,
+                config=config,
+                fallback_bubbles=(neutral_bubbles, original_bubbles),
+            )
+        except ValueError as error:
+            # A pair the model cannot rewrite twice yields no preference, but it
+            # says nothing about the rest of the corpus, so drop it and continue.
+            skipped_pairs.append({"pair_id": pair_id, "reason": str(error)})
+            continue
         texts = ["\n".join(candidate) for candidate in bubbles]
         rewards = _score_rewrites(
             pair_id=pair_id,
@@ -1333,6 +1352,19 @@ def _generate_and_score_locally(config: dict[str, Any]) -> dict[str, Any]:
                 "bubbles": bubbles,
                 "rewards": rewards,
             }
+        )
+
+    if skipped_pairs:
+        print(
+            f"Skipped {len(skipped_pairs)}/{len(records)} pairs lacking two distinct "
+            f"candidates; first was {skipped_pairs[0]['pair_id']}",
+            flush=True,
+        )
+    minimum_yield = float(config.get("min_preference_yield", 0.5))
+    if len(candidate_groups) < max(1, int(minimum_yield * len(records))):
+        raise ValueError(
+            f"Only {len(candidate_groups)} of {len(records)} pairs produced candidate "
+            f"groups, under the {minimum_yield:.0%} floor; the rewrite model looks degenerate"
         )
 
     initial_selections = [
@@ -1411,6 +1443,7 @@ def _generate_and_score_locally(config: dict[str, Any]) -> dict[str, Any]:
             "pairs": len(preference_records),
             "train_pairs": len(training_records),
             "validation_pairs": len(validation_records),
+            "skipped_pairs": len(skipped_pairs),
             "candidates_per_input": config["candidates_per_input"],
             "reward_exponents": exponents.as_dict(),
             "previous_state_path": config["previous_state_path"],
@@ -2058,6 +2091,147 @@ def _upload_sft_splits(sft_dir: str, run_name: str) -> tuple[str, str]:
     )
 
 
+def _call_stage(function: Any, config: dict[str, Any]) -> dict[str, Any]:
+    """Invoke a stage Function from the remote orchestrator and validate its result."""
+
+    print(f"Calling {function.tag}", flush=True)
+    result = function.remote(config)
+    if not isinstance(result, dict):
+        raise TypeError(f"Expected stage result object, received {type(result).__name__}")
+    print(
+        f"Finished {function.tag}: status={result.get('status')} skipped={result.get('skipped')}",
+        flush=True,
+    )
+    return result
+
+
+def _execute_stamp_command(
+    *,
+    command: str,
+    config: dict[str, Any],
+    prepare_config: dict[str, Any] | None = None,
+    round_number: int = 1,
+    call_stage: Callable[[Any, dict[str, Any]], dict[str, Any]] = _call_stage,
+) -> dict[str, Any]:
+    """Run one STAMP command after inputs are already on Modal volumes.
+
+    Living inside Modal (via ``orchestrate_stamp``) means later stages keep
+    chaining even if the local ``modal run --detach`` client disconnects.
+    """
+
+    results: dict[str, Any] = {"command": command}
+    model_name = str(config["model_name"])
+
+    if command in {"prepare", "run"}:
+        if prepare_config is None:
+            raise ValueError("prepare_config is required for prepare/run")
+        results["prepare"] = call_stage(prepare_neutralization_inputs, prepare_config)
+        if command == "prepare":
+            return results
+
+    if command in {"neutralize", "run"}:
+        results["neutralize"] = call_stage(neutralize, config)
+        if command == "neutralize":
+            return results
+
+    if command in {"classifier", "run"}:
+        results["classifier"] = call_stage(train_style_classifier, config)
+        if command == "classifier":
+            return results
+
+    if command in {"sft", "run"}:
+        sft_result = call_stage(train_initial_sft, config)
+        results["sft"] = sft_result
+        if command == "sft":
+            return results
+        current_state = str(
+            sft_result.get("state_path") or f"{config['initial_sft_dir']}/final"
+        )
+    else:
+        current_state = _default_state_path(config, round_number)
+
+    if command in {"preferences", "cpo"}:
+        if round_number > int(config["rounds"]):
+            raise ValueError(
+                f"round_number {round_number} exceeds configured rounds {config['rounds']}"
+            )
+        previous_state = _default_state_path(config, round_number)
+        round_config = _round_config(config, round_number, previous_state)
+        if command == "preferences":
+            results["preferences"] = call_stage(
+                generate_and_score_preferences,
+                round_config,
+            )
+            return results
+        results["cpo"] = call_stage(train_cpo_round, round_config)
+        return results
+
+    round_states: list[str] = []
+    if command == "run":
+        for current_round in range(1, int(config["rounds"]) + 1):
+            round_config = _round_config(config, current_round, current_state)
+            results[f"preferences-{_round_name(current_round)}"] = call_stage(
+                generate_and_score_preferences,
+                round_config,
+            )
+            cpo_result = call_stage(train_cpo_round, round_config)
+            results[f"cpo-{_round_name(current_round)}"] = cpo_result
+            current_state = str(
+                cpo_result.get("state_path")
+                or f"{round_config['cpo_dir']}/final"
+            )
+            round_states.append(current_state)
+    else:
+        round_states = [
+            f"{config['stamp_output_dir']}/rounds/{_round_name(index)}/cpo/final"
+            for index in range(1, int(config["rounds"]) + 1)
+        ]
+
+    if command in {"evaluate", "run"}:
+        evaluation_config = dict(config)
+        evaluation_config.update(
+            {
+                "initial_state_path": f"{config['initial_sft_dir']}/final",
+                "initial_adapter_dir": f"{config['initial_sft_dir']}/final",
+                "round_state_paths": round_states,
+                "adapter_dirs": [
+                    f"{config['initial_sft_dir']}/final",
+                    *round_states,
+                ],
+                "model_states": {
+                    "base": model_name,
+                    "initial-sft": f"{config['initial_sft_dir']}/final",
+                    **{
+                        _round_name(index): path
+                        for index, path in enumerate(round_states, start=1)
+                    },
+                },
+                "output_dir": config["evaluation_dir"],
+                "output_path": f"{config['evaluation_dir']}/metrics.json",
+            }
+        )
+        results["evaluate"] = call_stage(evaluate, evaluation_config)
+    return results
+
+
+@app.function(**_ORCHESTRATOR_FUNCTION_OPTIONS)
+def orchestrate_stamp(
+    command: str,
+    config: dict[str, Any],
+    prepare_config: dict[str, Any] | None = None,
+    round_number: int = 1,
+) -> dict[str, Any]:
+    """Run the STAMP stage graph entirely on Modal so detach survives sleep."""
+
+    return _execute_stamp_command(
+        command=command,
+        config=config,
+        prepare_config=prepare_config,
+        round_number=round_number,
+        call_stage=_call_stage,
+    )
+
+
 def _spawn_and_wait(function: Any, config: dict[str, Any]) -> dict[str, Any]:
     call = function.spawn(config)
     print(f"Spawned {function.tag} FunctionCall: {call.object_id}")
@@ -2091,6 +2265,9 @@ def main(
 
     Commands: prepare, neutralize, classifier, sft, preferences, cpo, evaluate,
     and run. ``source_path`` must be an outgoing-only prepared split directory.
+
+    Uploads happen locally; stage chaining runs in ``orchestrate_stamp`` so
+    ``modal run --detach`` can finish SFT/CPO/eval after the laptop sleeps.
     """
     normalized_command = command.lower().replace("_", "-")
     aliases = {
@@ -2135,6 +2312,7 @@ def main(
     )
     print(f"STAMP artifacts: imessage-sft-artifacts:/{run_name}/stamp")
 
+    prepare_config: dict[str, Any] | None = None
     if normalized_command in {"prepare", "run"}:
         remote_source, inputs_are_prepared = _upload_private_inputs(source_path, run_name)
         prepare_config = dict(config)
@@ -2163,89 +2341,18 @@ def main(
                     "sft_validation_path": sft_validation_path,
                 }
             )
-        prepare_result = _spawn_and_wait(
-            prepare_neutralization_inputs,
-            prepare_config,
-        )
-        if normalized_command == "prepare":
-            _print_result(prepare_result)
-            return
 
-    if normalized_command in {"neutralize", "run"}:
-        neutralize_result = _spawn_and_wait(neutralize, config)
-        if normalized_command == "neutralize":
-            _print_result(neutralize_result)
-            return
-
-    if normalized_command in {"classifier", "run"}:
-        classifier_result = _spawn_and_wait(train_style_classifier, config)
-        if normalized_command == "classifier":
-            _print_result(classifier_result)
-            return
-
-    if normalized_command in {"sft", "run"}:
-        sft_result = _spawn_and_wait(train_initial_sft, config)
-        if normalized_command == "sft":
-            _print_result(sft_result)
-            return
-        current_state = str(
-            sft_result.get("state_path") or f"{config['initial_sft_dir']}/final"
-        )
-    else:
-        current_state = _default_state_path(config, round_number)
-
-    if normalized_command in {"preferences", "cpo"}:
-        if round_number > int(config["rounds"]):
-            raise ValueError(
-                f"round_number {round_number} exceeds configured rounds {config['rounds']}"
-            )
-        previous_state = _default_state_path(config, round_number)
-        round_config = _round_config(config, round_number, previous_state)
-        if normalized_command == "preferences":
-            _print_result(_spawn_and_wait(generate_and_score_preferences, round_config))
-            return
-        _print_result(_spawn_and_wait(train_cpo_round, round_config))
-        return
-
-    round_states: list[str] = []
-    if normalized_command == "run":
-        for current_round in range(1, int(config["rounds"]) + 1):
-            round_config = _round_config(config, current_round, current_state)
-            _spawn_and_wait(generate_and_score_preferences, round_config)
-            cpo_result = _spawn_and_wait(train_cpo_round, round_config)
-            current_state = str(
-                cpo_result.get("state_path")
-                or f"{round_config['cpo_dir']}/final"
-            )
-            round_states.append(current_state)
-    else:
-        round_states = [
-            f"{config['stamp_output_dir']}/rounds/{_round_name(index)}/cpo/final"
-            for index in range(1, int(config["rounds"]) + 1)
-        ]
-
-    if normalized_command in {"evaluate", "run"}:
-        evaluation_config = dict(config)
-        evaluation_config.update(
-            {
-                "initial_state_path": f"{config['initial_sft_dir']}/final",
-                "initial_adapter_dir": f"{config['initial_sft_dir']}/final",
-                "round_state_paths": round_states,
-                "adapter_dirs": [
-                    f"{config['initial_sft_dir']}/final",
-                    *round_states,
-                ],
-                "model_states": {
-                    "base": model_name,
-                    "initial-sft": f"{config['initial_sft_dir']}/final",
-                    **{
-                        _round_name(index): path
-                        for index, path in enumerate(round_states, start=1)
-                    },
-                },
-                "output_dir": config["evaluation_dir"],
-                "output_path": f"{config['evaluation_dir']}/metrics.json",
-            }
-        )
-        evaluation_result = _spawn_and_wait(evaluate, evaluation_config)
-        _print_result(evaluation_result)
+    call = orchestrate_stamp.spawn(
+        normalized_command,
+        config,
+        prepare_config,
+        round_number,
+    )
+    print(f"Spawned orchestrate_stamp FunctionCall: {call.object_id}")
+    print(
+        "Pipeline is remote; with `modal run --detach` it keeps going if this "
+        "client disconnects or the laptop sleeps.",
+        flush=True,
+    )
+    result = call.get()
+    _print_result(result)

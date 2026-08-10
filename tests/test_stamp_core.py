@@ -40,6 +40,7 @@ from imessage_mlx.stamp.rewards import (
 from imessage_mlx.stamp.sft import (
     build_sft_example,
     parse_rewrite_output,
+    validate_rewrite,
 )
 from imessage_mlx.utils import read_jsonl
 
@@ -125,6 +126,36 @@ def test_neutral_validation_checks_content_invariants() -> None:
         "placeholders_changed",
         "length_out_of_bounds",
     } <= set(invalid.errors)
+
+
+def test_rewrite_validation_allows_texting_style_the_neutral_rules_reject() -> None:
+    neutral = ["Hold on, I'll send the name."]
+    styled = ["Wait send name"]
+    assert "person_changed" in validate_neutral(neutral, styled).errors
+    assert validate_rewrite(neutral, styled).valid
+
+    # Short messages swing hard in length once the sender's voice is back.
+    assert validate_rewrite(["yes"], ["YES LMAO"]).valid
+
+
+def test_rewrite_validation_still_rejects_content_drift() -> None:
+    assert "numbers_changed" in validate_rewrite(
+        ["I can meet at 7."],
+        ["can meet at 8"],
+    ).errors
+    assert "negation_changed" in validate_rewrite(
+        ["I cannot make it."],
+        ["im coming"],
+    ).errors
+    assert "placeholders_changed" in validate_rewrite(
+        ["Sorry. <|attachment|>"],
+        ["sry"],
+    ).errors
+
+
+def test_first_person_survives_a_contraction() -> None:
+    # "we're" collapses to "were", which must not read as a lost pronoun.
+    assert validate_neutral(["We are extremely exhausted"], ["We're so fried"]).valid
 
 
 def test_neutral_validation_rejects_lost_first_person_and_reported_speech() -> None:

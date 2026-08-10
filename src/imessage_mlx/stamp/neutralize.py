@@ -287,10 +287,15 @@ def negation_count(text: str) -> int:
 def has_first_person(text: str) -> bool:
     """Report whether the text speaks in first person."""
 
-    normalized = text.lower().replace("’", "")
-    return any(
-        token.replace("'", "") in _FIRST_PERSON for token in _WORD_RE.findall(normalized)
-    )
+    normalized = text.lower().replace("’", "'")
+    for token in _WORD_RE.findall(normalized):
+        # Collapsing a contraction turns "we're" into "were", which reads as a
+        # past-tense verb rather than a pronoun, so test its head too.
+        if token.replace("'", "") in _FIRST_PERSON:
+            return True
+        if token.split("'", maxsplit=1)[0] in _FIRST_PERSON:
+            return True
+    return False
 
 
 def is_reported_speech(text: str) -> bool:
