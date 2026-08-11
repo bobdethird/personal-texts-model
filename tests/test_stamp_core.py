@@ -463,6 +463,26 @@ def test_rewards_are_bounded_and_dynamic_exponents_follow_reversals() -> None:
     assert 0 <= preferred.aggregate(exponents) <= 1
 
 
+def test_reward_stays_on_the_same_scale_as_reachability() -> None:
+    # A weighted product collapsed toward zero as exponents grew, so hope/fear
+    # selection saw only the reachability term and ranked by base-model
+    # likelihood alone.
+    strong = _reward("strong", style=0.9, semantic=0.9, likelihood=0.02)
+    sharp = RewardExponents(style=5, semantic=4, likelihood=1, length=4)
+    assert strong.aggregate(sharp) > 0.5
+    assert strong.aggregate(sharp) > strong.base_model_likelihood**0.1 / 10
+
+
+def test_hope_prefers_the_stylish_candidate_over_the_likelier_bland_one() -> None:
+    # The texting-style rewrite is always less probable under the base model;
+    # picking by likelihood is what trained the model back toward plain English.
+    stylish = _reward("stylish", text="Ok just gimme", style=0.99, likelihood=0.015)
+    bland = _reward("bland", text="Ok just give me", style=0.30, likelihood=0.062)
+    selection = select_hope_and_fear([stylish, bland])
+    assert selection.hope.candidate_id == "stylish"
+    assert selection.fear.candidate_id == "bland"
+
+
 def test_hope_fear_selection_is_distinct_and_deterministic_on_ties() -> None:
     candidates = [_reward("c"), _reward("a"), _reward("b")]
     selection = select_hope_and_fear(candidates)

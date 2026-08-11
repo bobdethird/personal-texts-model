@@ -7,10 +7,17 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+_MIN_SCORE = 1e-12
+
 
 @dataclass(frozen=True, slots=True)
 class RewardExponents:
-    """Integer temperatures for the adapted STAMP weighted product."""
+    """Integer temperatures for the adapted STAMP weighted product.
+
+    ``likelihood`` is still tracked and reported because reversals on it inform
+    the other temperatures, but it does not weight the reward itself: hope/fear
+    selection already scores reachability from the same quantity.
+    """
 
     style: int = 1
     semantic: int = 1
@@ -84,13 +91,27 @@ class CandidateReward:
         return self.base_model_likelihood
 
     def aggregate(self, exponents: RewardExponents | None = None) -> float:
+        """Score the quality objectives as a weighted geometric mean in [0, 1].
+
+        A raw weighted product shrinks toward zero as the exponents grow, which
+        left the reward orders of magnitude under the reachability term that
+        hope/fear selection adds it to, reducing that selection to a pure
+        base-model-likelihood ranking. Averaging in log space keeps the reward
+        on the same scale as reachability, which also already scores
+        likelihood, so likelihood is left out here rather than counted twice.
+        """
+
         weights = exponents or RewardExponents()
-        return (
-            self.style_probability**weights.style
-            * self.semantic_similarity**weights.semantic
-            * self.base_model_likelihood**weights.likelihood
-            * self.length_score**weights.length
+        terms = (
+            (weights.style, self.style_probability),
+            (weights.semantic, self.semantic_similarity),
+            (weights.length, self.length_score),
         )
+        total = sum(weight for weight, _ in terms)
+        logged = sum(
+            weight * math.log(max(score, _MIN_SCORE)) for weight, score in terms
+        )
+        return math.exp(logged / total)
 
     def objective_scores(self) -> dict[str, float]:
         return {
