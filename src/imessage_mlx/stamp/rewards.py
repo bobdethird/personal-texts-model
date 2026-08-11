@@ -7,16 +7,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-_MIN_SCORE = 1e-12
-
 
 @dataclass(frozen=True, slots=True)
 class RewardExponents:
-    """Integer temperatures for the adapted STAMP weighted product.
+    """Integer temperatures for the STAMP weighted product (Eq. 4).
 
-    ``likelihood`` is still tracked and reported because reversals on it inform
-    the other temperatures, but it does not weight the reward itself: hope/fear
-    selection already scores reachability from the same quantity.
+    ``likelihood`` is tracked and reported because its reversal count still
+    informs the other temperatures, but it never weights the reward: the paper
+    keeps likelihood out of ``R`` entirely.
     """
 
     style: int = 1
@@ -91,27 +89,21 @@ class CandidateReward:
         return self.base_model_likelihood
 
     def aggregate(self, exponents: RewardExponents | None = None) -> float:
-        """Score the quality objectives as a weighted geometric mean in [0, 1].
+        """Weighted product of the quality objectives, per STAMP Eq. 4.
 
-        A raw weighted product shrinks toward zero as the exponents grow, which
-        left the reward orders of magnitude under the reachability term that
-        hope/fear selection adds it to, reducing that selection to a pure
-        base-model-likelihood ranking. Averaging in log space keeps the reward
-        on the same scale as reachability, which also already scores
-        likelihood, so likelihood is left out here rather than counted twice.
+        ``R = style**a * semantic**b * length**g``. Likelihood is deliberately
+        excluded: the paper scores it only through the separate model term of
+        hope/fear selection, never inside the reward. Selection drops that model
+        term entirely (see ``select_hope_and_fear``), so the shrinking scale of
+        the product no longer matters -- candidates are ranked by ``R`` alone.
         """
 
         weights = exponents or RewardExponents()
-        terms = (
-            (weights.style, self.style_probability),
-            (weights.semantic, self.semantic_similarity),
-            (weights.length, self.length_score),
+        return (
+            self.style_probability**weights.style
+            * self.semantic_similarity**weights.semantic
+            * self.length_score**weights.length
         )
-        total = sum(weight for weight, _ in terms)
-        logged = sum(
-            weight * math.log(max(score, _MIN_SCORE)) for weight, score in terms
-        )
-        return math.exp(logged / total)
 
     def objective_scores(self) -> dict[str, float]:
         return {
@@ -203,19 +195,22 @@ def select_hope_and_fear(
     candidates: Sequence[CandidateReward],
     *,
     exponents: RewardExponents | None = None,
-    model_temperature: float = 0.1,
+    model_temperature: float = 0.0,
 ) -> HopeFearSelection:
-    """Select reachable high/low reward candidates with deterministic tie breaks.
+    """Select high/low reward candidates with deterministic tie breaks.
 
-    Following STAMP, hope maximizes ``M**tau + R`` and fear maximizes
-    ``M**tau - R``. The selected candidates are forced to be distinct so the
+    STAMP scores hope by ``M**tau + R`` and fear by ``M**tau - R``, but its
+    ablation (footnote 9, Table 3) finds the model term unhelpful and drops it.
+    We follow that by defaulting ``model_temperature`` to 0, where ``M**0 == 1``
+    is constant and selection reduces to the paper's final criterion: hope is
+    the highest reward, fear the lowest. The two are forced distinct so the
     result is always usable as a preference pair.
     """
 
     if len(candidates) < 2:
         raise ValueError("Hope/fear selection requires at least two candidates")
-    if model_temperature <= 0:
-        raise ValueError("model_temperature must be positive")
+    if model_temperature < 0:
+        raise ValueError("model_temperature must be non-negative")
     keys = [_stable_candidate_key(candidate) for candidate in candidates]
     if any(not key[0] for key in keys) or len(set(keys)) != len(keys):
         raise ValueError("Candidates must have unique nonempty IDs or texts")

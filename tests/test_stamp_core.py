@@ -463,19 +463,20 @@ def test_rewards_are_bounded_and_dynamic_exponents_follow_reversals() -> None:
     assert 0 <= preferred.aggregate(exponents) <= 1
 
 
-def test_reward_stays_on_the_same_scale_as_reachability() -> None:
-    # A weighted product collapsed toward zero as exponents grew, so hope/fear
-    # selection saw only the reachability term and ranked by base-model
-    # likelihood alone.
-    strong = _reward("strong", style=0.9, semantic=0.9, likelihood=0.02)
+def test_reward_excludes_likelihood_per_stamp_equation_four() -> None:
+    # R = style**a * semantic**b * length**g, with likelihood deliberately out:
+    # two candidates that differ only in likelihood must score identically.
+    high_lik = _reward("hi", style=0.7, semantic=0.6, likelihood=0.9, length=1.0)
+    low_lik = _reward("lo", style=0.7, semantic=0.6, likelihood=0.01, length=1.0)
     sharp = RewardExponents(style=5, semantic=4, likelihood=1, length=4)
-    assert strong.aggregate(sharp) > 0.5
-    assert strong.aggregate(sharp) > strong.base_model_likelihood**0.1 / 10
+    assert high_lik.aggregate(sharp) == low_lik.aggregate(sharp)
+    assert high_lik.aggregate(sharp) == pytest.approx(0.7**5 * 0.6**4)
 
 
-def test_hope_prefers_the_stylish_candidate_over_the_likelier_bland_one() -> None:
+def test_hope_ignores_likelihood_and_picks_the_stylish_candidate() -> None:
     # The texting-style rewrite is always less probable under the base model;
-    # picking by likelihood is what trained the model back toward plain English.
+    # ranking by likelihood is what trained the model back toward plain English.
+    # With the model term dropped (tau_M=0), the higher-reward rewrite wins.
     stylish = _reward("stylish", text="Ok just gimme", style=0.99, likelihood=0.015)
     bland = _reward("bland", text="Ok just give me", style=0.30, likelihood=0.062)
     selection = select_hope_and_fear([stylish, bland])
